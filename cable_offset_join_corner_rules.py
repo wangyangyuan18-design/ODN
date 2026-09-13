@@ -1,18 +1,17 @@
 # -*- coding: utf-8 -*-
 """Final Offset policy extensions for new-cable joining and lane-change timing.
 
-Rules:
+Rules enforced here:
 1. A new Cable, including a true Return Cable, joins a common Cable Group on
-   the physical side from which it originally enters. Once that entry side is
-   established, it is sticky for the segment unless an explicit engineering
-   conflict requires a change.
+   the physical side from which it originally enters. The entry side is sticky
+   for the whole continuous segment unless a real engineering conflict forces
+   a side change.
 2. A normal Lane change happens at the route Corner Pole, not before it.
-   Incoming geometry stays on the old Lane up to the Pole; outgoing geometry
-   starts on the new Lane from the same Pole. No ordinary 0.30 m takeoff is
-   introduced by this rule.
+   Incoming geometry remains on the previous Lane up to the Corner Pole and
+   outgoing geometry starts on the new Lane from that same Pole.
 
 This module is a narrow extension of the single unified cable_offset_policy
-seam. It does not create another Lane allocator or a second geometry engine.
+seam. It does not create another Lane allocator or another geometry engine.
 """
 
 from math import hypot
@@ -22,6 +21,7 @@ from qgis.core import QgsPointXY
 from . import cable_offset_core as _core
 from . import cable_offset_layout as _base
 from . import cable_offset_policy as _policy
+from . import cable_offset_direction_fix as _direction_fix
 
 _INSTALLED = False
 _ORIGINAL_PLAN = _core._plan
@@ -36,12 +36,15 @@ def _node_match(a, b, eps=1e-7):
     return hypot(float(a.x()) - float(b.x()), float(a.y()) - float(b.y())) <= eps
 
 
-def _entry_side_from_original_geometry(segment, edge, edge_crs, work):
-    """Infer the side where a new cable physically enters the shared route.
+def _all_edges(segment):
+    return [
+        e for raw in segment.get("edge_sequence", []) or []
+        if (e := _base._canonical_edge(raw))
+    ]
 
-    Prefer the original segment geometry because it represents the cable's
-    actual incoming side before the Offset Core rewrites its final lanes.
-    """
+
+def _entry_side_from_geometry(segment, edge, edge_crs, work):
+    """Read the physical side of the original incoming cable geometry."""
     points = segment.get("points", []) or []
     if len(points) < 2:
         return 0
@@ -49,141 +52,229 @@ def _entry_side_from_original_geometry(segment, edge, edge_crs, work):
         a, b = _base._edge_points(edge)
         a = _core._tp(a, edge_crs, work)
         b = _core._tp(b, edge_crs, work)
-        tangent_x = b.x() - a.x()
-        tangent_y = b.y() - a.y()
-        length = hypot(tangent_x, tangent_y)
+        dx = b.x() - a.x()
+        dy = b.y() - a.y()
+        length = hypot(dx, dy)
         if length <= 1e-9:
             return 0
         for raw in points[1:]:
             if len(raw) < 2:
                 continue
             probe = _core._tp(QgsPointXY(float(raw[0]), float(raw[1])), edge_crs, work)
-            cross = tangent_x * (probe.y() - a.y()) - tangent_y * (probe.x() - a.x())
-            eps = max(1e-7, length * 1e-7)
-            if abs(cross) > eps:
+            cross = dx * (probe.y() - a.y()) - dy * (probe.x() - a.x())
+            if abs(cross) > max(1e-7, length * 1e-7):
                 return 1 if cross > 0 else -1
     except Exception:
         return 0
     return 0
 
 
-def _paired_return_side(design, segment_index, edge_index, slots):
-    """Recover the Return's original group side from its paired Forward route."""
+def _paired_return_side(designs, design_index, segment_index, edge_index, slots):
+    """Return the Forward cable's physical side for a true Return."""
+    design = designs[design_index]
     segment = design.get("segments", [])[segment_index]
     if not segment.get("_odn_return_chain"):
         return 0
     pair_index = segment.get("_odn_return_pair_segment")
     if pair_index is None:
         return 0
-    return_edges = [
-        e for raw in segment.get("edge_sequence", []) or []
-        if (e := _base._canonical_edge(raw))
-    ]
+    return_edges = _all_edges(segment)
     if edge_index >= len(return_edges):
         return 0
     pair_key = (
-        next((i for i, d in enumerate(_DESIGNS) if d is design), -1),
+        design_index,
         int(pair_index),
         len(return_edges) - 1 - edge_index,
     )
-    previous = slots.get(pair_key)
-    if previous not in (None, 0):
-        return _sign(previous)
+    pair_slot = int(slots.get(pair_key, 0))
+    if pair_slot != 0:
+        return _sign(pair_slot)
+
+    # Forward Main Lane has no side sign. In that case use the original Return
+    # geometry first; if it gives no evidence, the group-normalizer below will
+    # place the Return on the existing group's outer side rather than crossing.
     return 0
 
 
-_DESIGNS = []
+def _entry_side_for_use(use, designs, edge_crs, work, slots):
+    """Determine the immutable physical side at the point this Cable joins."""
+    design = designs[use.design_index]
+    segment = design.get("segments", [])[use.segment_index]
+
+    side = _entry_side_from_geometry(segment, use.edge_key, edge_crs, work)
+    if side in (1, -1):
+        return side
+
+    side = _paired_return_side(
+        designs, use.design_index, use.segment_index, use.edge_index, slots
+    )
+    if side in (1, -1):
+        return side
+
+    old = int(slots.get((use.design_index, use.segment_index, use.edge_index), 0))
+    if old != 0:
+        return _sign(old)
+
+    hint = int(use.side_hint or 0)
+    if hint in (1, -1):
+        return hint
+    return 0
+
+
+def _is_new_entry(use, by_edge):
+    """A cable is new to the shared group on its first edge with another use."""
+    for edge in sorted(
+        by_edge,
+        key=lambda e: min(
+            (u.segment_index, u.edge_index)
+            for u in by_edge[e]
+            if u.design_index == use.design_index and u.segment_index == use.segment_index
+        ) if any(u.design_index == use.design_index and u.segment_index == use.segment_index for u in by_edge[e]) else (10**9, 10**9),
+    ):
+        members = by_edge[edge]
+        own = any(
+            u.design_index == use.design_index
+            and u.segment_index == use.segment_index
+            for u in members
+        )
+        other = any(u.design_index != use.design_index for u in members)
+        if own and other:
+            return edge == use.edge_key
+    return use.edge_index == 0
+
+
+def _group_other_side_candidates(use, by_edge, slots):
+    """Return the signs already occupied by other cables on this physical Edge."""
+    signs = []
+    for other in by_edge.get(use.edge_key, []):
+        if other.design_index == use.design_index and other.segment_index == use.segment_index:
+            continue
+        value = int(slots.get((other.design_index, other.segment_index, other.edge_index), 0))
+        if value != 0:
+            signs.append(_sign(value))
+    return signs
+
+
+def _outer_side_for_new_join(entry_side, use, by_edge, slots):
+    """Keep a new cable on its entry side and place it outside the group."""
+    occupied_same = []
+    for other in by_edge.get(use.edge_key, []):
+        if other.design_index == use.design_index and other.segment_index == use.segment_index:
+            continue
+        value = int(slots.get((other.design_index, other.segment_index, other.edge_index), 0))
+        if value != 0 and _sign(value) == entry_side:
+            occupied_same.append(abs(value))
+    # Main Lane is signless. A new cable entering the left/right side therefore
+    # starts at the nearest free magnitude on that same physical side.
+    magnitude = max(1, max(occupied_same, default=0) + 1)
+    return entry_side * magnitude
 
 
 def _patched_plan(designs, dc, edge_layer, spacing):
-    global _DESIGNS
     result = _ORIGINAL_PLAN(designs, dc, edge_layer, spacing)
     if not result or len(result) < 5:
         return result
 
-    _DESIGNS = designs
     edge_crs, work, ordered, routes, slots = result
     pending, _ = _core._collect_uses(designs, edge_crs, work)
-
-    # Stable entry-side memory is intentionally segment-scoped. A new cable is
-    # allowed to join a group on the side from which it physically enters, but
-    # it must not switch side later merely because another side has a free slot.
-    entry_side = {}
+    by_edge = {}
     for use in pending:
-        if use.edge_index != 0:
-            continue
-        design = designs[use.design_index]
-        segment = design.get("segments", [])[use.segment_index]
-        seg_key = (use.design_index, use.segment_index)
-        side = _entry_side_from_original_geometry(
-            segment, use.edge_key, edge_crs, work
-        )
-        if side == 0:
-            side = _paired_return_side(design, use.segment_index, use.edge_index, slots)
-        if side == 0:
-            old = int(slots.get((use.design_index, use.segment_index, use.edge_index), 0))
-            if old:
-                side = _sign(old)
-        if side == 0:
-            side = 1 if int(use.side_hint or 0) >= 0 else -1
-        entry_side[seg_key] = side
+        by_edge.setdefault(use.edge_key, []).append(use)
 
-    # Enforce the new-cable / Return entry-side rule without disturbing
-    # existing same-side order. Repack only the affected segment where a
-    # first-edge assignment would otherwise cross to the other side.
-    changed = 0
+    # Store the side of first entry per continuous segment. Once a cable has
+    # joined the Group, subsequent free slots never authorize an opposite-side
+    # jump.
+    entry_side = {}
+    join_adjusted = 0
+    for use in pending:
+        if not _is_new_entry(use, by_edge):
+            continue
+        side = _entry_side_for_use(use, designs, edge_crs, work, slots)
+        if side not in (1, -1):
+            # Return from a Main-Lane Forward has no intrinsic sign. In that
+            # case keep any side already present for this Return segment;
+            # otherwise prefer the side indicated by the physical entry hint.
+            existing = [
+                _sign(int(slots.get((u.design_index, u.segment_index, u.edge_index), 0)))
+                for u in by_edge.get(use.edge_key, [])
+                if u.design_index == use.design_index
+                and u.segment_index == use.segment_index
+                and int(slots.get((u.design_index, u.segment_index, u.edge_index), 0)) != 0
+            ]
+            side = existing[0] if existing else 1
+        entry_side[(use.design_index, use.segment_index)] = side
+
     for use in pending:
         key = (use.design_index, use.segment_index, use.edge_index)
-        if key not in slots:
+        current = int(slots.get(key, 0))
+        if current == 0:
+            # Main Lane is not a left/right side. Do not turn Main into a side
+            # lane merely to satisfy the new-entry rule.
             continue
-        seg_key = (use.design_index, use.segment_index)
-        remembered = entry_side.get(seg_key)
-        if remembered not in (1, -1):
-            continue
-        value = int(slots[key])
-        if use.edge_index == 0 and value != 0 and _sign(value) != remembered:
-            # Preserve magnitude when possible; move only to the remembered
-            # physical side. Main Lane remains slot 0 when it is valid.
-            magnitude = max(1, abs(value))
-            candidate = remembered * magnitude
-            occupied = {int(v) for k, v in slots.items() if k[1:] == key[1:] and k != key}
-            while candidate in occupied:
-                magnitude += 1
-                candidate = remembered * magnitude
-            slots[key] = candidate
-            changed += 1
 
+        sticky = entry_side.get((use.design_index, use.segment_index))
+        if sticky not in (1, -1):
+            continue
         if use.edge_index > 0:
             previous = int(slots.get((use.design_index, use.segment_index, use.edge_index - 1), 0))
-            current = int(slots[key])
-            if previous != 0 and current != 0 and _sign(previous) != remembered:
-                magnitude = max(1, abs(current))
-                candidate = remembered * magnitude
-                occupied = {int(v) for k, v in slots.items() if k[0] == use.design_index and k[1] == use.segment_index and k != key}
-                while candidate in occupied:
-                    magnitude += 1
-                    candidate = remembered * magnitude
-                slots[key] = candidate
-                changed += 1
+            if previous != 0:
+                # Once inside the group, preserve the established physical side.
+                if _sign(current) != sticky:
+                    magnitude = max(1, abs(current))
+                    candidate = sticky * magnitude
+                    occupied = {
+                        int(v) for k, v in slots.items()
+                        if k[0] == use.design_index
+                        and k[1] == use.segment_index
+                        and k != key
+                    }
+                    while candidate in occupied:
+                        magnitude += 1
+                        candidate = sticky * magnitude
+                    slots[key] = candidate
+                    join_adjusted += 1
+            continue
 
-    if changed:
+        # On the actual group-entry Edge, never insert into the middle of the
+        # existing group. Keep the physical entry side and append outside.
+        desired = _outer_side_for_new_join(sticky, use, by_edge, slots)
+        if _sign(current) != sticky or abs(current) != abs(desired):
+            occupied = {
+                int(v) for k, v in slots.items()
+                if k != key
+                and any(
+                    o.design_index == k[0]
+                    and o.segment_index == k[1]
+                    and o.edge_index == k[2]
+                    for o in pending
+                    if o.edge_key == use.edge_key
+                )
+            }
+            candidate = desired
+            while candidate in occupied:
+                candidate = sticky * (abs(candidate) + 1)
+            slots[key] = candidate
+            join_adjusted += 1
+
+    if join_adjusted:
         _core._log(
-            f"[JOIN-SIDE] new-entry-side-adjusted={changed}; "
-            "rule=ENTER_SIDE_STICKY; return=NEW_CABLE"
+            f"[JOIN-SIDE] adjusted={join_adjusted}; rule=ENTER_SIDE_STICKY; "
+            "new-cable=OUTSIDE; return=NEW_CABLE"
         )
 
-    # Re-run the unified final landing validator after any slot correction.
     validator = getattr(_policy, "_validate_final_pole_landings", None)
     if validator is not None:
         validator(designs, dc, edge_crs, work, slots)
-
     return edge_crs, work, ordered, routes, slots
 
 
-def _oriented_edge(edge, node, incoming, edge_crs, work):
+def _oriented_edge(edge, node, incoming):
+    edge_crs = getattr(_direction_fix, "_ORIENT_EDGE_CRS", None)
+    work = getattr(_direction_fix, "_ORIENT_WORK_CRS", None)
     a, b = _base._edge_points(edge)
-    a = _core._tp(a, edge_crs, work)
-    b = _core._tp(b, edge_crs, work)
+    if edge_crs is not None and work is not None:
+        a = _core._tp(a, edge_crs, work)
+        b = _core._tp(b, edge_crs, work)
     if incoming:
         if _node_match(b, node):
             return a, b
@@ -198,21 +289,8 @@ def _oriented_edge(edge, node, incoming, edge_crs, work):
 
 
 def _corner_at_pole(node, in_edge, out_edge, prev_slot, next_slot, spacing):
-    # Direction-aware work CRS endpoints.
-    edge_crs = getattr(_core, "_ORIENT_EDGE_CRS", None)
-    work = getattr(_core, "_ORIENT_WORK_CRS", None)
-    if edge_crs is None or work is None:
-        # Direction seam keeps these globals on its own module; discover the
-        # source by using the current work edge coordinates when available.
-        try:
-            in_a, in_b = _core._edge_points_work(in_edge)
-            out_a, out_b = _core._edge_points_work(out_edge)
-        except Exception:
-            return None
-    else:
-        in_a, in_b = _oriented_edge(in_edge, node, True, edge_crs, work)
-        out_a, out_b = _oriented_edge(out_edge, node, False, edge_crs, work)
-
+    in_a, in_b = _oriented_edge(in_edge, node, True)
+    out_a, out_b = _oriented_edge(out_edge, node, False)
     in_dir = _base._unit(in_a, in_b)
     out_dir = _base._unit(out_a, out_b)
     incoming_anchor = _core._offset_lane_point(node, in_dir, prev_slot, spacing)
@@ -229,15 +307,10 @@ def _patched_corner(node, in_edge, out_edge, prev_slot, next_slot, spacing, retu
         )
 
     points = _corner_at_pole(node, in_edge, out_edge, prev_slot, next_slot, spacing)
-    if points is None:
-        return _ORIGINAL_CORNER(
-            node, in_edge, out_edge, prev_slot, next_slot, spacing, return_context
-        )
-
     decision = _core._corner_decision(prev_slot, next_slot, return_context=False)
     _core._log(
         f"[LANE-CHANGE] decision={decision}; prev={prev_slot}; next={next_slot}; "
-        f"timing=CORNER_POLE; early-change=FORBIDDEN"
+        "timing=CORNER_POLE; early-change=FORBIDDEN; geometry=AT_POLE"
     )
     return decision, points
 
@@ -251,7 +324,7 @@ def install():
     _INSTALLED = True
     _core._log(
         "[POLICY-EXT] new-entry-side=STICKY; return=NEW_CABLE; "
-        "lane-change=AT_CORNER_POLE; early-change=FORBIDDEN"
+        "group=OUTSIDE; lane-change=AT_CORNER_POLE; early-change=FORBIDDEN"
     )
 
 
