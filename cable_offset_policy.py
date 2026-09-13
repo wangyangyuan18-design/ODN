@@ -326,10 +326,7 @@ def _normalize_lanes(designs, dc, edge_layer, spacing, result):
         a = _core._tp(a, edge_crs, work)
         b = _core._tp(b, edge_crs, work)
         return set(_base._existing_slot_occupancy(
-            QgsGeometry.fromPolylineXY([a, b]),
-            spacing,
-            spatial_index,
-            geometries,
+            QgsGeometry.fromPolylineXY([a, b]), spacing, spatial_index, geometries
         ))
 
     owners = _endpoint_landing_owners(designs, edge_crs, work)
@@ -338,17 +335,40 @@ def _normalize_lanes(designs, dc, edge_layer, spacing, result):
         design_index: order
         for order, design_index in enumerate(sorted(routes, key=lambda idx: _route_rank(routes, idx)))
     }
-    edge_order = sorted(
-        by_edge,
-        key=lambda edge: min(
-            (
-                route_order.get(use.design_index, 10**9),
-                use.segment_index,
-                use.edge_index,
-            )
-            for use in by_edge[edge]
-        ),
-    )
+
+    edge_dependencies = {}
+    for edge, uses in by_edge.items():
+        dependencies = set()
+        for use in uses:
+            if use.prev_edge_key is not None and use.prev_edge_key in by_edge:
+                if use.prev_edge_key != edge:
+                    dependencies.add(use.prev_edge_key)
+        edge_dependencies[edge] = dependencies
+
+    remaining_edges = set(by_edge)
+    processed_edges = set()
+    edge_order = []
+    while remaining_edges:
+        ready = [
+            edge for edge in remaining_edges
+            if edge_dependencies.get(edge, set()).issubset(processed_edges)
+        ]
+        if not ready:
+            ready = list(remaining_edges)
+        chosen_edge = min(
+            ready,
+            key=lambda edge: min(
+                (
+                    route_order.get(use.design_index, 10**9),
+                    use.segment_index,
+                    use.edge_index,
+                )
+                for use in by_edge[edge]
+            ),
+        )
+        edge_order.append(chosen_edge)
+        remaining_edges.remove(chosen_edge)
+        processed_edges.add(chosen_edge)
 
     main_owner = {}
     side_memory = {}
@@ -390,9 +410,7 @@ def _normalize_lanes(designs, dc, edge_layer, spacing, result):
             ]
             if previous_zero:
                 primary = min(previous_zero, key=lambda use: (
-                    route_order.get(use.design_index, 10**9),
-                    use.segment_index,
-                    use.edge_index,
+                    route_order.get(use.design_index, 10**9), use.segment_index, use.edge_index
                 ))
             else:
                 established = [
@@ -401,9 +419,7 @@ def _normalize_lanes(designs, dc, edge_layer, spacing, result):
                 ]
                 if established:
                     primary = min(established, key=lambda use: (
-                        route_order.get(use.design_index, 10**9),
-                        use.segment_index,
-                        use.edge_index,
+                        route_order.get(use.design_index, 10**9), use.segment_index, use.edge_index
                     ))
                 else:
                     previous_planned = [
@@ -412,15 +428,11 @@ def _normalize_lanes(designs, dc, edge_layer, spacing, result):
                     ]
                     if previous_planned:
                         primary = min(previous_planned, key=lambda use: (
-                            route_order.get(use.design_index, 10**9),
-                            use.segment_index,
-                            use.edge_index,
+                            route_order.get(use.design_index, 10**9), use.segment_index, use.edge_index
                         ))
                     else:
                         primary = min(candidates, key=lambda use: (
-                            route_order.get(use.design_index, 10**9),
-                            use.segment_index,
-                            use.edge_index,
+                            route_order.get(use.design_index, 10**9), use.segment_index, use.edge_index
                         ))
 
         if primary is not None:
@@ -545,16 +557,11 @@ def _normalize_lanes(designs, dc, edge_layer, spacing, result):
 
 
 def _preplan_validate_pole_exclusivity(designs, edge_crs, work):
-    """Defer Pole landing validation until after Lane planning.
-
-    The old Core check conflated a route endpoint with a guaranteed physical
-    landing, so it could abort before the affected cable had a chance to move
-    off Main Lane because of a real Pole conflict.
-    """
+    """Defer Pole landing validation until after Lane planning."""
     return None
 
 
-def _validate_final_pole_landings(designs, edge_crs, work, slots):
+def _validate_final_pole_landings(designs, dc, edge_crs, work, slots):
     owners = {}
     for design_index, design in enumerate(designs or []):
         sequence_ids = design.get("sequence_ids", []) or []
@@ -580,16 +587,22 @@ def _validate_final_pole_landings(designs, edge_crs, work, slots):
                     (design_index, segment_index, "END", _kind(end_item))
                 )
 
+    external_points = _external_endpoint_points(dc, designs, work)
+    for node_key, items in owners.items():
+        if not external_points or not _point_occupied(QgsPointXY(*node_key), external_points):
+            continue
+        kinds = [item[3] for item in items]
+        if kinds and all(_core._shared_node(kind) or str(kind).startswith("FATRETURN") for kind in kinds):
+            continue
+        raise RuntimeError(f"Offset Policy: final Cable landing conflicts with existing DC at node={node_key}")
+
     conflicts = []
     for node_key, items in owners.items():
         independent = sorted({item[0] for item in items})
         if len(independent) <= 1:
             continue
         kinds = [item[3] for item in items]
-        if kinds and all(
-            _core._shared_node(kind) or str(kind).startswith("FATRETURN")
-            for kind in kinds
-        ):
+        if kinds and all(_core._shared_node(kind) or str(kind).startswith("FATRETURN") for kind in kinds):
             continue
         conflicts.append((node_key, independent))
 
@@ -598,16 +611,14 @@ def _validate_final_pole_landings(designs, edge_crs, work, slots):
             f"node={key}; links={[designs[i].get('_link_id', designs[i].get('link', i)) for i in ids]}"
             for key, ids in conflicts[:20]
         )
-        raise RuntimeError(
-            "Offset Policy: ordinary Pole has multiple final Cable landings: " + detail
-        )
+        raise RuntimeError("Offset Policy: ordinary Pole has multiple final Cable landings: " + detail)
 
 
 def _patched_plan(designs, dc, edge_layer, spacing):
     result = _ORIGINAL_PLAN(designs, dc, edge_layer, spacing)
     normalized = _normalize_lanes(designs, dc, edge_layer, spacing, result)
     edge_crs, work, ordered, routes, slots = normalized
-    _validate_final_pole_landings(designs, edge_crs, work, slots)
+    _validate_final_pole_landings(designs, dc, edge_crs, work, slots)
     return normalized
 
 
@@ -640,8 +651,8 @@ def _return_anchored_geometry(segment, slot_by_edge, spacing, work, edge_crs, co
 
     _core._log(
         f"[RETURN-GEOM] role={segment.get('_odn_return_role','')}; "
-        f"start={_core._corner_debug_point(first_a)}; "
-        f"end={_core._corner_debug_point(last_b)}; slots={slots}; endpoints=PHYSICAL"
+        f"start={_core._corner_debug_point(first_a)}; end={_core._corner_debug_point(last_b)}; "
+        f"slots={slots}; endpoints=PHYSICAL"
     )
     return result
 
@@ -657,8 +668,7 @@ def install():
     _INSTALLED = True
     _core._log(
         "[POLICY] unified-lane-state installed; main=stable-owner/free-slot0; "
-        "side=sticky-sign; order=group-outside; compact=same-side-only; "
-        "return=topology-derived"
+        "side=sticky-sign; order=group-outside; compact=same-side-only; return=topology-derived"
     )
 
 
