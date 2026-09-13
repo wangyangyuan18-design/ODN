@@ -14,18 +14,17 @@ def classFactory(iface):
     from .odn_project_validation import install_validation_page
     from .odn_project import OdnProjectWizard
     from .odn_project_integration import install_project_creation_integration
-    # Install route orientation/audit before Link Design imports Offset Core entry points.
+    # Offset seams are installed before Link Design creates/uses the design engine.
     from . import cable_offset_direction_fix
+    from . import cable_offset_policy
+    from . import cable_offset_join_corner_rules
+    # Final single global lane optimizer: Main/side/order/compactness/crossing control.
+    from . import cable_offset_lane_optimizer
     from .link_design import LinkDesignDock
     from .fat_return import install_fat_return_button
     from .link_design_features import install_link_design_feature_buttons
     from .plugin_undo import undo_last
     from .odn_link_rules import install_project_config_defaults
-    # Install the single final policy seam after all Offset Core imports.
-    from . import cable_offset_policy
-    # Final policy extension: new-cable/Return entry-side stability and
-    # lane-change timing at the actual Corner Pole.
-    from . import cable_offset_join_corner_rules
 
     install_validation_page(OdnProjectWizard)
     install_project_creation_integration(OdnProjectWizard)
