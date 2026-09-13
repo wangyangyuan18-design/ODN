@@ -20,6 +20,7 @@ def classFactory(iface):
     from .plugin_undo import undo_last
     from .odn_link_rules import install_project_config_defaults
     from . import cable_offset_pole_occupancy
+    from . import cable_offset_corner_diagnostic
 
     install_validation_page(OdnProjectWizard)
     install_project_creation_integration(OdnProjectWizard)
