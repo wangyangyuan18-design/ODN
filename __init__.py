@@ -14,6 +14,9 @@ def classFactory(iface):
     from .odn_project_validation import install_validation_page
     from .odn_project import OdnProjectWizard
     from .odn_project_integration import install_project_creation_integration
+    # Install the direction-sensitive Cable Offset patch before Link Design
+    # imports any Offset Core entry points.
+    from . import cable_offset_direction_fix
     from .link_design import LinkDesignDock
     from .fat_return import install_fat_return_button
     from .link_design_features import install_link_design_feature_buttons
