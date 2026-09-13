@@ -30,11 +30,7 @@ jobs:
         run: python tools/validate_plugin.py
 
       - name: Compile Python sources
-        run: |
-          python -m compileall -q \
-            --invalidation-mode checked-hash \
-            --exclude='(^|/)\.git(/|$)' \
-            .
+        run: python -m compileall -q .
 
       - name: Read plugin version
         id: version
@@ -81,20 +77,34 @@ jobs:
           test -f "$ZIP"
           unzip -t "$ZIP"
           unzip -l "$ZIP" | grep -E 'ODN_Tools_Pro/(metadata.txt|__init__\.py|icons/odn_tools_pro\.svg)$'
+          unzip -l "$ZIP" | grep -E 'ODN_Tools_Pro/tools/(validate_plugin\.py|fat_trace_build_ready\.txt|patch_fat_trace\.py)$'
           ! unzip -l "$ZIP" | grep -E '(^|/)\.git/|(^|/)\.github/|(^|/)__pycache__/|\.pyc$|ODN_Tools_Pro.*\.zip$'
 
-      - name: Upload production ZIP artifact
+      - name: Generate SHA256
+        shell: bash
+        run: |
+          cd dist
+          sha256sum "ODN_Tools_Pro-v${{ steps.version.outputs.version }}.zip" > "ODN_Tools_Pro-v${{ steps.version.outputs.version }}.zip.sha256"
+          cat "ODN_Tools_Pro-v${{ steps.version.outputs.version }}.zip.sha256"
+
+      - name: Upload versioned production artifact
         uses: actions/upload-artifact@v4
         with:
           name: ODN_Tools_Pro-production-v${{ steps.version.outputs.version }}-${{ github.sha }}
-          path: dist/ODN_Tools_Pro-v${{ steps.version.outputs.version }}.zip
+          path: |
+            dist/ODN_Tools_Pro-v${{ steps.version.outputs.version }}.zip
+            dist/ODN_Tools_Pro-v${{ steps.version.outputs.version }}.zip.sha256
           if-no-files-found: error
           retention-days: 30
 
-      - name: Upload stable latest ZIP artifact
+      - name: Upload stable latest production artifact
+        if: github.event_name != 'pull_request'
         uses: actions/upload-artifact@v4
         with:
           name: ODN_Tools_Pro-production-latest
-          path: dist/ODN_Tools_Pro-v${{ steps.version.outputs.version }}.zip
+          path: |
+            dist/ODN_Tools_Pro-v${{ steps.version.outputs.version }}.zip
+            dist/ODN_Tools_Pro-v${{ steps.version.outputs.version }}.zip.sha256
           if-no-files-found: error
+          overwrite: true
           retention-days: 30
