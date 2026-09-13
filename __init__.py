@@ -23,6 +23,9 @@ def classFactory(iface):
     from .odn_link_rules import install_project_config_defaults
     # Install the single final policy seam after all Offset Core imports.
     from . import cable_offset_policy
+    # Final policy extension: new-cable/Return entry-side stability and
+    # lane-change timing at the actual Corner Pole.
+    from . import cable_offset_join_corner_rules
 
     install_validation_page(OdnProjectWizard)
     install_project_creation_integration(OdnProjectWizard)
