@@ -97,33 +97,75 @@ A 点表示特殊同点出线的控制位置：
 - 普通 Pole 上不存在其它 Cable 时，Cable 应直接连接 Pole。
 - 不允许为了非 0 Lane 人为制造 0.30 m takeoff 再回到 Pole。
 
+### Route Node 与 Cable Landing 必须分离
+
+- Pole Edge Route 中的 Pole 首先是 **Route Node**，表示拓扑经过该点；
+- 只有 Cable 确实在该 Pole 上结束/连接时，才是 **Cable Landing**；
+- `Lane = slot 0` 只表示该 Cable 使用 Main Lane，**不等于 Cable Landing**；
+- 因此普通 Offset Cable 经过 Pole 时，不得因为 `0 → 0` 就强制回到该 Pole 坐标；
+- 只有该 Pole 是本 Cable 的实际连接点时，才允许最终几何真正落到 Pole。
+
+### 主线优先，但已占用的 Pole 不能重复落点
+
+- Main Lane（slot 0）是优先通道；当该 Edge 没有真实冲突时，应优先让 Cable 占用 slot 0。
+- 如果另一条独立 Cable 已经在某个 Pole 真正落点/连接，例如 **D-B 已占用主线并在 B 落杆**，则另一条 **A-B** 即使在普通 Route 上仍希望使用 Main Lane，也不能继续使用 slot 0 直接落到 B。
+- 此时 B 视为已有 Cable Landing，A-B 必须在到达 B 之前保持自己的非 0 Lane，并沿连续 Offset Geometry 到 B 附近通过，不能再次落到 B。
+- 这不是取消 Main Lane 优先原则，而是 **Main Lane 优先 + Pole Landing 独占约束**：先占主线，遇到已被其它独立 Cable 占用的 Pole 再让受影响 Cable 提前离开主线。
+- 同一 Link 的 Forward / Return 在 FAT Pole 属于明确的特殊同点例外，因此 FAT Pole 可以有两条 Cable 共享连接点。
+
 ### 特殊节点
 
 FDT、FAT Return、BB、SFC/CL Closure 等可允许多 Cable 同点。
 
 特殊节点必须显式识别，不能用“附近距离小”之类模糊条件把普通 Pole 变成共享节点。
 
-## 8. 回缆 B 点
+## 8. Return Cable 定义
+
+Return 不是“方向反了”或“出现 FATRETURN 标记”就成立。必须同时满足：
+
+1. **同一 Link**；
+2. Return 与 Forward 使用**完全相同的 Pole Edge Chain**；
+3. 两条 Chain 的方向相反，即 Return 的 Edge 顺序必须是 Forward Chain 的严格逆序；
+4. Return 的起点必须是 **FAT 所在 Pole**，该点就是 FAT 的工程连接/夹角点；
+5. Return 的终点是该同一 Pole Edge Chain 的**另一端最末 Pole**；
+6. 同一 FAT Pole 是 Forward / Return 两条 Cable 的允许特殊共点；
+7. Return 离开 FAT Pole 后，与 Forward 来时的 Route 保持 **0.50 m** 的 Cable-to-Cable 间距，再沿目标方向继续。
+
+因此可以形式化为：
+
+```text
+Forward:
+FAT(P0) → P1 → P2 → ... → Pn
+
+Return:
+FAT(P0) ← P1 ← P2 ← ... ← Pn
+```
+
+实现层面，`FATRETURN` 只能作为旧数据或业务流程中的 Return 标记，不能单独决定 Return 的物理起点/终点。必须再检查完整 Pole Edge Chain 是否满足“同 Link + 同 Chain + 反向”。不满足时，不得把该 Cable 当成 Return Cable。
+
+Return 的中间 Pole 仍然只是 Route Node；除 FAT 起点外，不得因为 Lane=0 自动把 Return 几何吸回中间 Pole。
+
+## 9. 回缆 B 点
 
 B 点是 Return Cable 场景：
 
-1. Cable 先正常到达目标点；
-2. 到达端保持正常直接连接；
-3. Return 从同一点重新出发；
-4. Return 根据目的地决定向上还是向下展开；
-5. Return 出线属于特殊同点出线，可使用 0.30 m control distance；
-6. Return 与本线路来时 Route 保持 0.50 m；
-7. 再沿目标方向继续。
+1. Forward Cable 先正常到达 FAT / 目标工程点；
+2. FAT Pole 保持正常直接连接；
+3. Return 从**同一个 FAT Pole**重新出发；
+4. Return 出线属于特殊同点出线，可使用 0.30 m control distance；
+5. Return 与 Forward 来时 Route 保持 0.50 m；
+6. 再沿与 Forward 完全相同、但方向相反的 Pole Edge Chain 回走；
+7. 到达另一端最末 Pole 后结束。
 
 Return 不能被当作普通 Corner，也不能把 0.30 m 应用于整个普通路线。
 
-## 9. FAT 与 Cable 完全解耦
+## 10. FAT 与 Cable 完全解耦
 
 FAT 是所属 Link 的工程节点，而不是 Cable 的强制几何控制点。
 
 处理顺序必须是：
 
-**Link ownership → complete Route → main/Lane → final Cable geometry → FAT landing**
+**Link ownership → complete Route → main/Lane → node landing constraint → final Cable geometry → FAT landing**
 
 因此：
 
@@ -133,23 +175,25 @@ FAT 是所属 Link 的工程节点，而不是 Cable 的强制几何控制点。
 - FAT 不得同时属于两个独立 Link。
 - 同一 Link 的 Forward/Return 可以在 FAT 工程点形成允许的特殊共点。
 
-## 10. 拐角几何
+## 11. 拐角几何
 
 - 普通 Corner 使用连续 offset geometry。
 - 同一 Lane 在 Pole Edge 转角处采用 offset-line intersection / miter，必要时 bevel fallback。
 - 不把原 Pole 节点作为普通 offset Cable 的“进杆再出杆”中间点。
 - 角度不固定 90°；优先由实际 Pole Edge 方向、Lane 间距和连续几何自然形成。
 - 0.30 m 不得出现在普通 Corner。
+- Return FAT 起点属于特殊同点出线，不使用普通 Corner 规则替代。
 
-## 11. 主线与 Pole 的连续使用
+## 12. 主线与 Pole 的连续使用
 
 - 主线一旦由完整 Route 判断为最佳通道，应尽量连续使用。
 - 如果 slot 0 无真实冲突、无既有 Cable 占用且无工程节点限制，优先 slot 0。
 - 不允许因为局部 Edge 有其它空 slot 就放弃主线。
 - 不允许出现主线→非主线→主线的无理由往复。
+- 如果主线上的目标 Pole 已经由另一条独立 Cable 真正占用，必须把该 Pole 作为局部 Landing 冲突处理，受影响 Cable 应提前离开 slot 0，而不是最后“落杆再出去”。
 - 相邻 Pole 之间已有约 1 m 的有效空间时，应优先使用连续主通道。
 
-## 12. 问题 1~8 的统一处理顺序
+## 13. 问题 1~8 的统一处理顺序
 
 1. 读取完整 Link Route。
 2. 计算 Route priority / longest directional run / turn / reversal。
@@ -157,13 +201,14 @@ FAT 是所属 Link 的工程节点，而不是 Cable 的强制几何控制点。
 4. 按完整 Route 顺序规划 Lane。
 5. 保持已有 Cable Group 相对顺序。
 6. 新 Cable 从 Group 外侧加入。
-7. 检查普通 Pole 独占与特殊节点例外。
+7. 检查普通 Pole 独占、已有 Cable Landing 与特殊节点例外。
 8. 根据 Lane 生成连续 Cable geometry。
-9. 普通 Pole 直接 landing；特殊同点输出才使用 0.30 m。
-10. 最后根据 owning Link 的 final Cable geometry 做 FAT landing。
-11. 对最终结果执行 CRS、拓扑、异常长度和规则验证。
+9. Main Lane 不是 Cable Landing；只有真实工程连接点才允许最终几何落到 Pole。
+10. Return 只有在同一 Link、同一 Pole Edge Chain 且严格反向时成立；起点为 FAT Pole，终点为另一端最末 Pole，并保持 0.50 m 回缆间距。
+11. 最后根据 owning Link 的 final Cable geometry 做 FAT landing。
+12. 对最终结果执行 CRS、拓扑、异常长度和规则验证。
 
-## 13. Offset Core 架构要求
+## 14. Offset Core 架构要求
 
 Offset 不再继续使用 v5→v3→v2→v9→v8 的运行时 monkey-patch 链。
 
@@ -178,6 +223,8 @@ Lane Planner
   ↓
 Node Constraint Planner
   ↓
+Return Relation Check
+  ↓
 Continuous Geometry Builder
   ↓
 FAT Landing
@@ -185,9 +232,11 @@ FAT Landing
 Final Distribution Cable geometry
 ```
 
+当前运行时只有一个 Return + Pole Landing Policy 层接入权威 `cable_offset_core.py`；不再加载此前临时的 Pole Occupancy 和 Corner Diagnostic 模块。
+
 所有距离和偏移计算必须在一个米制 projected CRS 中完成；原始 Pole Edge `edge_sequence` 是权威拓扑，Offset 不能改变原始路由拓扑。
 
-## 14. 验收标准
+## 15. 验收标准
 
 一次完整测试必须同时检查 1~8：
 
@@ -196,9 +245,14 @@ Final Distribution Cable geometry
 - 相邻 Cable 普通间距 0.50 m；
 - 普通 Corner 连续，不出现进 Pole→出 Pole；
 - 普通 Pole 不被两个独立 Link 同时真正落点；
+- `slot=0` 不自动等于 Pole Landing；
+- 已被另一条独立 Cable 占用的 Pole 不被第二条 Cable 再次落点；
 - 普通非 0 Lane 不自动触发 0.30 m；
 - 特殊同点出线使用 0.30 m → 0.50 m；
-- Return B 点先正常到达，再特殊 takeoff 返回；
+- Return 仅在同 Link + 同 Pole Edge Chain + 反向时成立；
+- Return 起点为 FAT Pole，终点为同 Chain 另一端最末 Pole；
+- FAT Pole 允许 Forward / Return 两条 Cable 特殊共点；
+- Return 与 Forward 来时 Route 保持 0.50 m；
 - FAT 只跟随 owning Link 的 final geometry；
 - FAT 不迫使其它 Link 改线；
 - 新 Cable 从 Cable Group 外侧加入；
