@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """Runtime fix for direction-sensitive Cable Offset geometry.
 
-Canonical Pole Edge identity is intentionally directionless.  This module
+Canonical Pole Edge identity is intentionally directionless. This module
 keeps that identity for lane allocation but restores the actual route
 orientation whenever side hints or corner geometry are calculated.
 """
@@ -40,7 +40,7 @@ def _oriented_edge(edge, node, incoming):
             return a, b
         if _same_point(b, node):
             return b, a
-    return (a, b) if incoming else (a, b)
+    return (a, b)
 
 
 _ORIENT_EDGE_CRS = None
@@ -83,8 +83,6 @@ def _collect_uses(designs, edge_crs, work_crs):
                     end,
                     _base._route_side_hint(start, end, a, b),
                 )
-                use.route_a = QgsPointXY(a)
-                use.route_b = QgsPointXY(b)
                 ca, cb = _base._edge_points(edge)
                 ca = _core._tp(ca, edge_crs, work_crs)
                 cb = _core._tp(cb, edge_crs, work_crs)
@@ -136,7 +134,7 @@ def _build_corner_geometry(node, in_edge, out_edge, prev_slot, next_slot, spacin
     return decision, points
 
 
-# Install only these two seams.  All D/E/F primitives remain in the existing
+# Install only these two seams. All D/E/F primitives remain in the existing
 # authoritative core; this patch only changes the direction supplied to them.
 _core._collect_uses = _collect_uses
 _core._build_corner_geometry = _build_corner_geometry
