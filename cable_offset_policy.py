@@ -1,28 +1,19 @@
 # -*- coding: utf-8 -*-
-"""Unified Offset Core policy rules.
+"""Unified final policy layer for the authoritative ODN Offset Core.
 
-This module is a policy layer for the single authoritative ``cable_offset_core``.
-It does not implement a second offset engine. It supplies two topology rules:
-
-1. Return is a real relation, not merely a ``FATRETURN`` endpoint label.
-   A Return is valid only when its Pole Edge chain is exactly the reverse of the
-   owning Forward chain. The Return starts at the FAT Pole and ends at the
-   opposite end of that same Pole Edge chain.
-2. Main Lane (slot 0) and actual Pole landing are different concepts. Slot 0 is
-   preferred when available, but an occupied Pole cannot be re-used as an
-   ordinary Cable landing. A Cable that would hit an occupied Pole is moved off
-   slot 0 on the incident Edge while the existing Cable keeps Main Lane ownership.
-
-This is one policy layer on the canonical Offset Core; it is not a second offset
-implementation and does not change CRS or route topology.
+This is the single policy seam loaded after the direction/orientation seam.
+It does not generate a second geometry engine. It enforces the documented
+lane/topology invariants on the slot map returned by cable_offset_core and
+keeps Return/FAT landing semantics explicit.
 """
 
 from math import hypot
 
-from qgis.core import QgsPointXY
+from qgis.core import QgsGeometry, QgsPointXY
 
 from . import cable_offset_core as _core
 from . import cable_offset_layout as _base
+
 
 NODE_EPS_M = 0.05
 
@@ -40,13 +31,7 @@ def _edge_list(segment):
     ]
 
 
-def _edge_chain_equal_reverse(a_edges, b_edges):
-    if len(a_edges) != len(b_edges):
-        return False
-    return all(left == right for left, right in zip(a_edges, reversed(b_edges)))
-
-
-def _item_kind(item):
+def _kind(item):
     try:
         return _core._kind(item)
     except Exception:
@@ -54,118 +39,102 @@ def _item_kind(item):
 
 
 def _is_fat(item):
-    return _item_kind(item) == "FAT"
+    return _kind(item) == "FAT"
 
 
-def _is_explicit_return_marker(item):
-    return _item_kind(item).startswith("FATRETURN")
+def _is_return_marker(item):
+    return _kind(item).startswith("FATRETURN")
 
 
-def _is_shared_landing(item):
-    return _core._shared_node(item) or _is_fat(item)
-
-
-def _sequence_item(sequence_ids, position):
-    if 0 <= position < len(sequence_ids):
-        return sequence_ids[position]
+def _sequence_item(sequence_ids, index):
+    if 0 <= index < len(sequence_ids):
+        return sequence_ids[index]
     return None
 
 
-def _node_key(point):
-    return round(float(point.x()), 7), round(float(point.y()), 7)
+def _edge_chain_reverse(a_edges, b_edges):
+    if len(a_edges) != len(b_edges):
+        return False
+    return all(a == b for a, b in zip(a_edges, reversed(b_edges)))
 
 
-def _return_candidates(design, sequence_ids):
-    """Find the physical FAT-origin Return relation.
-
-    A Return is identified from topology, not from the FATRETURN label alone:
-    there must be a segment starting at FAT whose complete Pole Edge chain has
-    an exact reverse match elsewhere in the same Link. FATRETURN, when present,
-    is only a legacy metadata marker for the same relation.
-    """
+def _return_candidates(design):
+    """Return only exact reverse-chain FAT-origin returns."""
+    sequence_ids = design.get("sequence_ids", []) or []
     segments = design.get("segments", []) or []
     candidates = []
     seen = set()
 
-    # Preferred path: explicit FATRETURN marker matched against the reverse chain.
+    # Explicit marker path, but topology is still mandatory.
     for marker_index, marker_segment in enumerate(segments):
-        start_item = _sequence_item(sequence_ids, marker_index)
-        end_item = _sequence_item(sequence_ids, marker_index + 1)
-        if not (_is_explicit_return_marker(start_item) or _is_explicit_return_marker(end_item)):
+        marker_item_a = _sequence_item(sequence_ids, marker_index)
+        marker_item_b = _sequence_item(sequence_ids, marker_index + 1)
+        if not (_is_return_marker(marker_item_a) or _is_return_marker(marker_item_b)):
             continue
         marker_edges = _edge_list(marker_segment)
         if not marker_edges:
             continue
 
-        for fat_index, fat_segment in enumerate(segments):
-            if fat_index == marker_index:
+        for pair_index, pair_segment in enumerate(segments):
+            if pair_index == marker_index:
                 continue
-            fat_start = _sequence_item(sequence_ids, fat_index)
-            fat_end = _sequence_item(sequence_ids, fat_index + 1)
-            fat_edges = _edge_list(fat_segment)
-            if not fat_edges or not _edge_chain_equal_reverse(fat_edges, marker_edges):
+            pair_edges = _edge_list(pair_segment)
+            if not pair_edges or not _edge_chain_reverse(pair_edges, marker_edges):
                 continue
-            if _is_fat(fat_start):
-                candidate = (fat_index, marker_index, True)
-            elif _is_fat(fat_end):
-                candidate = (marker_index, fat_index, False)
+
+            pair_start = _sequence_item(sequence_ids, pair_index)
+            pair_end = _sequence_item(sequence_ids, pair_index + 1)
+            marker_start = _sequence_item(sequence_ids, marker_index)
+            marker_end = _sequence_item(sequence_ids, marker_index + 1)
+
+            if _is_fat(pair_start):
+                candidate = (pair_index, marker_index)
+            elif _is_fat(marker_start):
+                candidate = (marker_index, pair_index)
+            elif _is_fat(pair_end) and _is_return_marker(marker_start):
+                candidate = (marker_index, pair_index)
+            elif _is_fat(marker_end) and _is_return_marker(pair_start):
+                candidate = (pair_index, marker_index)
             else:
                 continue
+
             if candidate in seen:
                 continue
             seen.add(candidate)
-            candidates.append({
-                "return_segment": candidate[0],
-                "paired_segment": candidate[1],
-                "edge_count": len(_edge_list(segments[candidate[0]])),
-                "fat_at_start": candidate[2],
-                "source": "FATRETURN_MARKER",
-            })
+            candidates.append((candidate[0], candidate[1], "FATRETURN_MARKER"))
 
-    # Authoritative fallback: infer Return directly from a reverse Pole Edge
-    # chain pair. This is the important path for current Link data that has no
-    # explicit FATRETURN marker.
+    # Topology-only authoritative path.
     for fat_index, fat_segment in enumerate(segments):
-        fat_start = _sequence_item(sequence_ids, fat_index)
-        fat_end = _sequence_item(sequence_ids, fat_index + 1)
         fat_edges = _edge_list(fat_segment)
         if not fat_edges:
             continue
-        if not _is_fat(fat_start) and not _is_fat(fat_end):
+        fat_start = _sequence_item(sequence_ids, fat_index)
+        fat_end = _sequence_item(sequence_ids, fat_index + 1)
+        if not (_is_fat(fat_start) or _is_fat(fat_end)):
             continue
 
         for pair_index, pair_segment in enumerate(segments):
             if pair_index == fat_index:
                 continue
             pair_edges = _edge_list(pair_segment)
-            if not pair_edges or not _edge_chain_equal_reverse(fat_edges, pair_edges):
+            if not pair_edges or not _edge_chain_reverse(fat_edges, pair_edges):
                 continue
 
-            # FAT must be the physical start of Return. If FAT is at the end of
-            # this segment, the pair is the candidate that starts at FAT.
             if _is_fat(fat_start):
-                candidate = (fat_index, pair_index, True)
+                candidate = (fat_index, pair_index)
+            elif _is_fat(fat_end):
+                candidate = (pair_index, fat_index)
             else:
-                candidate = (pair_index, fat_index, False)
+                continue
 
+            return_index, paired_index = candidate
+            if not _is_fat(_sequence_item(sequence_ids, return_index)):
+                continue
             if candidate in seen:
                 continue
 
-            # For a physical FAT-origin Return the chosen segment must itself
-            # start at FAT. If the pair is the opposite orientation, reject it.
-            return_index = candidate[0]
-            return_start = _sequence_item(sequence_ids, return_index)
-            if not _is_fat(return_start):
-                continue
-
             seen.add(candidate)
-            candidates.append({
-                "return_segment": return_index,
-                "paired_segment": candidate[1],
-                "edge_count": len(_edge_list(segments[return_index])),
-                "fat_at_start": True,
-                "source": "REVERSE_CHAIN_INFERENCE",
-            })
+            candidates.append((return_index, paired_index, "REVERSE_CHAIN_INFERENCE"))
 
     return candidates
 
@@ -173,6 +142,7 @@ def _return_candidates(design, sequence_ids):
 def _apply_return_semantics(design):
     sequence_ids = design.get("sequence_ids", []) or []
     segments = design.get("segments", []) or []
+
     for segment in segments:
         segment["_odn_return_chain"] = False
         segment["_odn_return_start"] = False
@@ -181,129 +151,70 @@ def _apply_return_semantics(design):
         segment["_odn_return_marker"] = False
         segment["_odn_return_pair_segment"] = None
 
-    for candidate in _return_candidates(design, sequence_ids):
-        idx = int(candidate["return_segment"])
-        if not (0 <= idx < len(segments)):
+    for return_index, paired_index, source in _return_candidates(design):
+        if not (0 <= return_index < len(segments)):
             continue
-        segment = segments[idx]
-        paired = int(candidate["paired_segment"])
-        start_item = _sequence_item(sequence_ids, idx)
-        end_item = _sequence_item(sequence_ids, idx + 1)
 
-        if _is_fat(start_item):
-            # Authoritative Return definition:
-            # FAT Pole -> exact reverse of Forward Pole Edge chain -> far Pole.
-            segment["_odn_return_chain"] = True
-            segment["_odn_return_start"] = True
-            segment["_odn_return_end"] = True
-            segment["_odn_return_role"] = "FAT_POLE_TO_SAME_POLE_EDGE_FAR_POLE"
-            segment["_odn_return_pair_segment"] = paired
-            # Both endpoints are physical Pole landings. The intermediate
-            # geometry remains the ordinary offset Lane geometry.
-            segment["_odn_special_start"] = True
-            segment["_odn_special_end"] = True
-        elif _is_fat(end_item):
-            # Unsupported physical orientation: retain explicit metadata but do
-            # not pretend the segment already starts at the FAT Pole.
-            segment["_odn_return_chain"] = True
-            segment["_odn_return_start"] = False
-            segment["_odn_return_end"] = True
-            segment["_odn_return_role"] = "FAT_AT_END_REVERSE_REQUIRED"
-            segment["_odn_return_pair_segment"] = paired
-            segment["_odn_special_start"] = False
-            segment["_odn_special_end"] = True
-        else:
+        segment = segments[return_index]
+        start_item = _sequence_item(sequence_ids, return_index)
+        end_item = _sequence_item(sequence_ids, return_index + 1)
+
+        if not _is_fat(start_item):
+            if _is_return_marker(start_item) or _is_return_marker(end_item):
+                segment["_odn_return_marker"] = True
             continue
+
+        segment["_odn_return_chain"] = True
+        segment["_odn_return_start"] = True
+        segment["_odn_return_end"] = True
+        segment["_odn_return_role"] = "FAT_POLE_TO_SAME_POLE_EDGE_CHAIN_FAR_POLE"
+        segment["_odn_return_pair_segment"] = int(paired_index)
+        segment["_odn_special_start"] = True
+        segment["_odn_special_end"] = True
 
         _core._log(
-            f"[return-policy] {design.get('fdt', '')}/{design.get('link', '')}; "
-            f"segment={idx}; paired={paired}; role={segment.get('_odn_return_role')}; "
-            f"edge_count={candidate.get('edge_count', 0)}; source={candidate.get('source')}; "
-            f"rule=FAT_START_SAME_POLE_EDGE_CHAIN_REVERSED"
+            f"[RETURN] {design.get('fdt','')}/{design.get('link','')}; "
+            f"segment={return_index}; paired={paired_index}; "
+            f"source={source}; rule=EXACT_REVERSE_CHAIN_FAT_START"
         )
 
-    # FATRETURN is only a marker. It must not turn the opposite Pole into a
-    # physical shared landing by itself.
     for index, segment in enumerate(segments):
         start_item = _sequence_item(sequence_ids, index)
         end_item = _sequence_item(sequence_ids, index + 1)
-        if _is_explicit_return_marker(start_item) and not segment.get("_odn_return_start"):
+        if _is_return_marker(start_item) and not segment.get("_odn_return_start"):
             segment["_odn_return_marker"] = True
             segment["_odn_special_start"] = False
-        if _is_explicit_return_marker(end_item) and not segment.get("_odn_return_end"):
+        if _is_return_marker(end_item) and not segment.get("_odn_return_end"):
             segment["_odn_return_marker"] = True
             segment["_odn_special_end"] = False
 
 
-def _patched_set_flags(designs):
+def _set_flags(designs):
     _ORIGINAL_SET_FLAGS(designs)
     for design in designs or []:
         _apply_return_semantics(design)
 
 
-def _endpoint_landing_records(designs, edge_crs, work):
-    records = {}
-    for design_index, design in enumerate(designs or []):
-        sequence_ids = design.get("sequence_ids", []) or []
-        for segment_index, segment in enumerate(design.get("segments", []) or []):
-            edges = _edge_list(segment)
-            if not edges:
-                continue
-            nodes = _base._extract_route_graph_nodes(segment, work, edge_crs, edge_crs)
-            if len(nodes) != len(edges) + 1:
-                continue
-            start_item = _sequence_item(sequence_ids, segment_index)
-            end_item = _sequence_item(sequence_ids, segment_index + 1)
-            if _is_shared_landing(start_item):
-                records.setdefault(_node_key(nodes[0]), []).append({
-                    "design_index": design_index,
-                    "segment_index": segment_index,
-                    "kind": _item_kind(start_item),
-                })
-            if _is_shared_landing(end_item) and not segment.get("_odn_return_chain"):
-                records.setdefault(_node_key(nodes[-1]), []).append({
-                    "design_index": design_index,
-                    "segment_index": segment_index,
-                    "kind": _item_kind(end_item),
-                })
-    return records
-
-
-def _candidate_nonzero_slot(side_hint, used):
-    preferred = 1 if int(side_hint or 0) >= 0 else -1
-    for magnitude in range(1, 21):
-        for sign in (preferred, -preferred):
-            candidate = sign * magnitude
-            if candidate not in used:
-                return candidate
-    return preferred * 21
-
-
 def _external_endpoint_points(dc, designs, work):
-    """Read endpoints of external DC only; current-link DC is excluded."""
     try:
         memory = _core._occupancy(dc, designs, work)
     except Exception:
-        memory = None
-    result = []
-    if memory is None:
-        return result
+        return []
+
+    points = []
     for feature in memory.getFeatures():
         try:
-            geom = feature.geometry()
-            if geom.isEmpty():
+            geometry = feature.geometry()
+            if geometry.isEmpty():
                 continue
-            if geom.isMultipart():
-                for part in geom.asMultiPolyline():
-                    if part:
-                        result.extend((QgsPointXY(part[0]), QgsPointXY(part[-1])))
-            else:
-                part = geom.asPolyline()
+            parts = geometry.asMultiPolyline() if geometry.isMultipart() else [geometry.asPolyline()]
+            for part in parts:
                 if part:
-                    result.extend((QgsPointXY(part[0]), QgsPointXY(part[-1])))
+                    points.append(QgsPointXY(part[0]))
+                    points.append(QgsPointXY(part[-1]))
         except Exception:
             continue
-    return result
+    return points
 
 
 def _point_occupied(point, endpoints):
@@ -313,9 +224,15 @@ def _point_occupied(point, endpoints):
     )
 
 
-def _uses(designs, edge_crs, work):
-    result = {}
+def _node_key(point):
+    return round(float(point.x()), 7), round(float(point.y()), 7)
+
+
+def _endpoint_landing_owners(designs, edge_crs, work):
+    """Declared segment endpoints are cable landings; internal route nodes are not."""
+    owners = {}
     for design_index, design in enumerate(designs or []):
+        sequence_ids = design.get("sequence_ids", []) or []
         for segment_index, segment in enumerate(design.get("segments", []) or []):
             edges = _edge_list(segment)
             if not edges:
@@ -323,142 +240,320 @@ def _uses(designs, edge_crs, work):
             nodes = _base._extract_route_graph_nodes(segment, work, edge_crs, edge_crs)
             if len(nodes) != len(edges) + 1:
                 continue
-            stored = segment.get("points", []) or []
-            if len(stored) >= 2:
-                start = _core._tp(QgsPointXY(float(stored[0][0]), float(stored[0][1])), edge_crs, work)
-                end = _core._tp(QgsPointXY(float(stored[-1][0]), float(stored[-1][1])), edge_crs, work)
-            else:
-                start, end = nodes[0], nodes[-1]
-            for edge_index, edge in enumerate(edges):
-                a, b = _base._edge_points(edge)
-                a = _core._tp(a, edge_crs, work)
-                b = _core._tp(b, edge_crs, work)
-                result[(design_index, segment_index, edge_index)] = {
-                    "design_index": design_index,
-                    "segment_index": segment_index,
-                    "edge_index": edge_index,
-                    "start_node": _node_key(nodes[edge_index]),
-                    "end_node": _node_key(nodes[edge_index + 1]),
-                    "side_hint": _base._route_side_hint(start, end, a, b),
-                    "return_chain": bool(segment.get("_odn_return_chain")),
-                }
-    return result
+
+            start_item = _sequence_item(sequence_ids, segment_index)
+            end_item = _sequence_item(sequence_ids, segment_index + 1)
+            if start_item is not None:
+                owners.setdefault(_node_key(nodes[0]), []).append(
+                    (design_index, segment_index, _kind(start_item))
+                )
+            if end_item is not None:
+                owners.setdefault(_node_key(nodes[-1]), []).append(
+                    (design_index, segment_index, _kind(end_item))
+                )
+    return owners
 
 
-def _ensure_return_lane_separation(designs, edge_crs, work, slots):
-    """Return is the second cable on an identical route: keep it off slot 0.
+def _use_endpoint_blocked(use, designs, owners, external_points, edge_crs, work):
+    """slot 0 is blocked only by a genuine cable landing conflict."""
+    design = designs[use.design_index]
+    segment = design["segments"][use.segment_index]
+    sequence_ids = design.get("sequence_ids", []) or []
+    edges = _edge_list(segment)
+    if not edges:
+        return False
 
-    The paired Forward Cable retains Main Lane whenever it already owns slot 0.
-    This guarantees that Return does not overlap the Forward cable while still
-    allowing Main Lane to remain the first-choice lane for the route group.
-    """
-    changed = 0
-    uses = _uses(designs, edge_crs, work)
-    for design_index, design in enumerate(designs or []):
-        for segment_index, segment in enumerate(design.get("segments", []) or []):
-            if not segment.get("_odn_return_chain"):
-                continue
-            paired_index = segment.get("_odn_return_pair_segment")
-            if paired_index is None:
-                continue
-            return_edges = _edge_list(segment)
-            if not return_edges:
-                continue
-            for edge_index, _ in enumerate(return_edges):
-                return_key = (design_index, segment_index, edge_index)
-                paired_key = (design_index, int(paired_index), len(return_edges) - 1 - edge_index)
-                if return_key not in slots or paired_key not in slots:
-                    continue
-                if int(slots.get(return_key, 0)) != 0:
-                    continue
-                # If the paired Forward is already on Main Lane, keep it there.
-                # Otherwise do not steal Main Lane from another cable; just move
-                # Return to the nearest free relative lane on this Edge.
-                used = {
-                    int(value)
-                    for other_key, value in slots.items()
-                    if other_key[2] == edge_index
-                    and other_key[1] == segment_index
-                }
-                paired_slot = int(slots.get(paired_key, 0))
-                if paired_slot == 0:
-                    side_hint = uses.get(return_key, {}).get("side_hint", 1)
-                    chosen = _candidate_nonzero_slot(side_hint, used)
-                    slots[return_key] = int(chosen)
-                    changed += 1
-                    _core._log(
-                        f"[return-lane] design={design_index}; segment={segment_index}; edge={edge_index}; "
-                        f"paired_segment={paired_index}; slot=0->{chosen}; "
-                        f"rule=FORWARD_MAIN_RETURN_0_50M_OFFSET"
-                    )
-    return changed
+    nodes = _base._extract_route_graph_nodes(segment, work, edge_crs, edge_crs)
+    if len(nodes) != len(edges) + 1:
+        return False
 
+    endpoint_keys = []
+    if use.edge_index == 0 and use.segment_index < len(sequence_ids):
+        endpoint_keys.append((_node_key(nodes[0]), "START"))
+    if use.edge_index == len(edges) - 1 and use.segment_index + 1 < len(sequence_ids):
+        endpoint_keys.append((_node_key(nodes[-1]), "END"))
 
-def _enforce_pole_landing_exclusion(designs, dc, edge_crs, work, slots):
-    """Keep slot 0 primary, but never create a second independent Pole landing."""
-    records = _endpoint_landing_records(designs, edge_crs, work)
-    external_endpoints = _external_endpoint_points(dc, designs, work)
-    uses = _uses(designs, edge_crs, work)
-    changed = 0
-
-    for use_key, use in uses.items():
-        if use["return_chain"]:
+    for key, endpoint_side in endpoint_keys:
+        point = QgsPointXY(*key)
+        if _point_occupied(point, external_points):
+            return True
+        other_design = any(owner[0] != use.design_index for owner in owners.get(key, []))
+        if not other_design:
             continue
 
-        start_key = use["start_node"]
-        end_key = use["end_node"]
-        blocked_nodes = set()
-        for node_key in (start_key, end_key):
-            owners = records.get(node_key, [])
-            other_design_owner = any(
-                item["design_index"] != use["design_index"]
-                for item in owners
+        # Only the FAT-origin point of a true Return is a deliberate shared
+        # landing. The far Pole remains ordinary/exclusive.
+        is_return_start = (
+            bool(segment.get("_odn_return_chain"))
+            and endpoint_side == "START"
+            and use.segment_index < len(sequence_ids)
+            and _is_fat(_sequence_item(sequence_ids, use.segment_index))
+        )
+        if not is_return_start:
+            return True
+    return False
+
+
+def _sign(value):
+    return 1 if int(value) > 0 else -1
+
+
+def _route_rank(routes, design_index):
+    route = routes.get(design_index, {})
+    return (
+        -float(route.get("priority_score", 0.0)),
+        -float(route.get("longest_directional_run", 0.0)),
+        -float(route.get("route_length", 0.0)),
+        int(design_index),
+    )
+
+
+def _normalize_lanes(designs, dc, edge_layer, spacing, result):
+    """Enforce Main owner, side, order and compactness globally."""
+    if not result or len(result) < 5:
+        return result
+
+    edge_crs, work, ordered, routes, slots = result
+    pending, _ = _core._collect_uses(designs, edge_crs, work)
+    by_edge = {}
+    for use in pending:
+        by_edge.setdefault(use.edge_key, []).append(use)
+
+    occupancy = _core._occupancy(dc, designs, work)
+    spatial_index, geometries = _base._build_existing_index(occupancy, work)
+
+    def reserved(edge):
+        a, b = _base._edge_points(edge)
+        a = _core._tp(a, edge_crs, work)
+        b = _core._tp(b, edge_crs, work)
+        return set(_base._existing_slot_occupancy(
+            QgsGeometry.fromPolylineXY([a, b]),
+            spacing,
+            spatial_index,
+            geometries,
+        ))
+
+    owners = _endpoint_landing_owners(designs, edge_crs, work)
+    external_points = _external_endpoint_points(dc, designs, work)
+    route_order = {
+        design_index: order
+        for order, design_index in enumerate(sorted(routes, key=lambda idx: _route_rank(routes, idx)))
+    }
+    edge_order = sorted(
+        by_edge,
+        key=lambda edge: min(
+            (
+                route_order.get(use.design_index, 10**9),
+                use.segment_index,
+                use.edge_index,
             )
-            external_owner = _point_occupied(QgsPointXY(*node_key), external_endpoints)
-            if other_design_owner or external_owner:
-                blocked_nodes.add(node_key)
+            for use in by_edge[edge]
+        ),
+    )
 
-        if not blocked_nodes or int(slots.get(use_key, 0)) != 0:
-            continue
+    # These are route state, not local-edge state.
+    main_owner = {}
+    side_memory = {}
+    order_memory = {}
+    assigned_slots = {}
+    main_switches = 0
+    side_crosses = 0
+    gaps_compacted = 0
+    blocked_main = 0
+    preserved = 0
 
-        own_owner = any(
-            item["design_index"] == use["design_index"]
-            for node_key in blocked_nodes
-            for item in records.get(node_key, [])
+    for edge in edge_order:
+        uses = by_edge[edge]
+        reserved_slots = reserved(edge)
+        used = set(reserved_slots)
+        previous_by_use = {}
+
+        for use in uses:
+            key = (use.design_index, use.segment_index, use.edge_index)
+            previous = assigned_slots.get((use.design_index, use.segment_index, use.edge_index - 1))
+            previous_by_use[key] = previous
+            segment_key = (use.design_index, use.segment_index)
+            if previous not in (None, 0):
+                side_memory.setdefault(segment_key, _sign(previous))
+                order_memory.setdefault((segment_key, use.design_index), abs(int(previous)))
+
+        candidates = [
+            use for use in uses
+            if not _use_endpoint_blocked(use, designs, owners, external_points, edge_crs, work)
+        ]
+        if 0 in reserved_slots:
+            candidates = []
+
+        primary = None
+        if candidates:
+            previous_zero = [
+                use for use in candidates
+                if previous_by_use[(use.design_index, use.segment_index, use.edge_index)] == 0
+            ]
+            if previous_zero:
+                primary = min(previous_zero, key=lambda use: (
+                    route_order.get(use.design_index, 10**9),
+                    use.segment_index,
+                    use.edge_index,
+                ))
+            else:
+                established = [
+                    use for use in candidates
+                    if main_owner.get((use.design_index, use.segment_index)) == use.design_index
+                ]
+                if established:
+                    primary = min(established, key=lambda use: (
+                        route_order.get(use.design_index, 10**9),
+                        use.segment_index,
+                        use.edge_index,
+                    ))
+                else:
+                    previous_planned = [
+                        use for use in candidates
+                        if int(slots.get((use.design_index, use.segment_index, use.edge_index), 999999)) == 0
+                    ]
+                    if previous_planned:
+                        primary = min(previous_planned, key=lambda use: (
+                            route_order.get(use.design_index, 10**9),
+                            use.segment_index,
+                            use.edge_index,
+                        ))
+                    else:
+                        primary = min(candidates, key=lambda use: (
+                            route_order.get(use.design_index, 10**9),
+                            use.segment_index,
+                            use.edge_index,
+                        ))
+
+        if primary is not None:
+            seg_key = (primary.design_index, primary.segment_index)
+            previous_owner = main_owner.get(seg_key)
+            assigned_key = (primary.design_index, primary.segment_index, primary.edge_index)
+            assigned_slots[assigned_key] = 0
+            used.add(0)
+            if previous_owner is not None and previous_owner != primary.design_index:
+                main_switches += 1
+            if previous_owner is None:
+                main_owner[seg_key] = primary.design_index
+
+        if primary is None and uses and 0 not in reserved_slots:
+            blocked_main += 1
+
+        non_main = [
+            use for use in uses
+            if (use.design_index, use.segment_index, use.edge_index) not in assigned_slots
+        ]
+        side_groups = {1: [], -1: []}
+
+        for use in non_main:
+            key = (use.design_index, use.segment_index, use.edge_index)
+            previous = previous_by_use.get(key)
+            segment_key = (use.design_index, use.segment_index)
+            if previous not in (None, 0):
+                side = _sign(previous)
+            elif side_memory.get(segment_key) in (1, -1):
+                side = side_memory[segment_key]
+            else:
+                old = int(slots.get(key, 0))
+                side = _sign(old) if old != 0 else (1 if int(use.side_hint or 0) >= 0 else -1)
+            side_groups[side].append((use, previous))
+
+        for side in (1, -1):
+            members = side_groups[side]
+
+            def member_key(item):
+                use, previous = item
+                segment_key = (use.design_index, use.segment_index)
+                previous_mag = (
+                    abs(int(previous))
+                    if previous not in (None, 0) and _sign(previous) == side
+                    else 10**6
+                )
+                historical = order_memory.get((segment_key, use.design_index), 10**6)
+                had_history = previous_mag < 10**6 or historical < 10**6
+                return (
+                    0 if had_history else 1,
+                    min(previous_mag, historical),
+                    route_order.get(use.design_index, 10**9),
+                    use.segment_index,
+                    use.edge_index,
+                )
+
+            members.sort(key=member_key)
+            old_mags = [
+                abs(int(previous))
+                for _, previous in members
+                if previous not in (None, 0) and _sign(previous) == side
+            ]
+            if old_mags and sorted(set(old_mags)) != list(range(1, len(set(old_mags)) + 1)):
+                gaps_compacted += 1
+
+            magnitude = 1
+            for use, previous in members:
+                while side * magnitude in used:
+                    magnitude += 1
+                chosen = side * magnitude
+                key = (use.design_index, use.segment_index, use.edge_index)
+                assigned_slots[key] = chosen
+                used.add(chosen)
+                segment_key = (use.design_index, use.segment_index)
+                side_memory[segment_key] = side
+                order_memory[(segment_key, use.design_index)] = magnitude
+                if previous not in (None, 0):
+                    if _sign(previous) != side:
+                        side_crosses += 1
+                    elif previous == chosen:
+                        preserved += 1
+                magnitude += 1
+
+        # Real constraints from Return/Pole policy are never erased by the
+        # normalization pass.
+        for use in uses:
+            key = (use.design_index, use.segment_index, use.edge_index)
+            if key in assigned_slots:
+                continue
+            old = int(slots.get(key, 0))
+            segment = designs[use.design_index]["segments"][use.segment_index]
+            if old == 0:
+                continue
+            if _use_endpoint_blocked(use, designs, owners, external_points, edge_crs, work) or segment.get("_odn_return_chain"):
+                side = _sign(old)
+                magnitude = abs(old)
+                while side * magnitude in used:
+                    magnitude += 1
+                assigned_slots[key] = side * magnitude
+                used.add(side * magnitude)
+                side_memory.setdefault((use.design_index, use.segment_index), side)
+
+        for use in uses:
+            key = (use.design_index, use.segment_index, use.edge_index)
+            chosen = int(assigned_slots.get(key, 0))
+            slots[key] = chosen
+            use.slot = chosen
+
+        planned_zero = sum(
+            1 for use in uses
+            if int(assigned_slots.get((use.design_index, use.segment_index, use.edge_index), 0)) == 0
         )
-        if own_owner and not any(
-            item["design_index"] != use["design_index"]
-            for node_key in blocked_nodes
-            for item in records.get(node_key, [])
-        ):
-            continue
+        if 0 not in reserved_slots and uses and primary is not None and planned_zero != 1:
+            raise RuntimeError(f"ODN lane policy: edge {edge} must have exactly one free Main Lane")
+        if 0 in reserved_slots and planned_zero:
+            raise RuntimeError(f"ODN lane policy: reserved Main Lane was assigned on edge {edge}")
 
-        used = {
-            int(value)
-            for other_key, value in slots.items()
-            if other_key[1:] == use_key[1:]
-        }
-        chosen = _candidate_nonzero_slot(use.get("side_hint", 0), used)
-        slots[use_key] = int(chosen)
-        changed += 1
-        blocked = next(iter(blocked_nodes))
-        _core._log(
-            f"[pole-landing-policy] design={use_key[0]}; segment={use_key[1]}; edge={use_key[2]}; "
-            f"blocked-node={blocked}; slot=0->{chosen}; "
-            f"rule=MAIN_LANE_FIRST_BUT_NO_SECOND_POLE_LANDING"
-        )
+    _core._log(
+        f"[LANE-SUMMARY] edges={len(edge_order)}; main_switches={main_switches}; "
+        f"side_crosses={side_crosses}; gaps_compacted={gaps_compacted}; "
+        f"blocked_main={blocked_main}; preserved={preserved}; rule=GLOBAL_ROUTE_STATE"
+    )
+    return (edge_crs, work, ordered, routes, slots)
 
-    return changed
+
+def _patched_plan(designs, dc, edge_layer, spacing):
+    result = _ORIGINAL_PLAN(designs, dc, edge_layer, spacing)
+    return _normalize_lanes(designs, dc, edge_layer, spacing, result)
 
 
 def _return_anchored_geometry(segment, slot_by_edge, spacing, work, edge_crs, control):
-    """Wrap the canonical geometry only to restore physical Return endpoints.
-
-    The canonical builder already produces the correct continuous offset body.
-    For a true Return, however, both ends are physical Pole landings. The
-    wrapper therefore changes only the first/last anchor and leaves all
-    intermediate Corner Core geometry untouched.
-    """
     result = _ORIGINAL_GEOMETRY(segment, slot_by_edge, spacing, work, edge_crs, control)
     if not result or not segment.get("_odn_return_chain"):
         return result
@@ -471,58 +566,40 @@ def _return_anchored_geometry(segment, slot_by_edge, spacing, work, edge_crs, co
         return result
 
     slots = [int(slot_by_edge.get(index, 0)) for index in range(len(edges))]
-    first_a = nodes[0]
-    first_b = nodes[1]
-    last_a = nodes[-2]
+    first_a, first_b = nodes[0], nodes[1]
     last_b = nodes[-1]
 
-    # Return starts exactly at FAT Pole, then takes off into its assigned lane.
-    if segment.get("_odn_return_start"):
+    if segment.get("_odn_return_start") and result:
         takeoff = _core._takeoff_entry(first_a, first_b, slots[0], spacing, control)
-        if result:
-            result[0] = QgsPointXY(first_a)
+        result[0] = QgsPointXY(first_a)
         if len(result) == 1 and hypot(takeoff.x() - first_a.x(), takeoff.y() - first_a.y()) > 1e-7:
             result.append(QgsPointXY(takeoff))
         elif len(result) >= 2 and hypot(takeoff.x() - first_a.x(), takeoff.y() - first_a.y()) > 1e-7:
             result[1] = QgsPointXY(takeoff)
 
-    # Return ends exactly at the opposite end Pole of the same Edge Chain.
     if segment.get("_odn_return_end") and result:
         result[-1] = QgsPointXY(last_b)
 
     _core._log(
-        f"[return-geometry] role={segment.get('_odn_return_role','')}; "
-        f"start={_core._corner_debug_point(first_a)}; end={_core._corner_debug_point(last_b)}; "
-        f"slots={slots}; physical_endpoints=ON"
+        f"[RETURN-GEOM] role={segment.get('_odn_return_role','')}; "
+        f"start={_core._corner_debug_point(first_a)}; "
+        f"end={_core._corner_debug_point(last_b)}; slots={slots}; endpoints=PHYSICAL"
     )
     return result
-
-
-def _patched_plan(designs, dc, edge_layer, spacing):
-    edge_crs, work, ordered, routes, slots = _ORIGINAL_PLAN(designs, dc, edge_layer, spacing)
-    changed_return = _ensure_return_lane_separation(designs, edge_crs, work, slots)
-    changed_pole = _enforce_pole_landing_exclusion(designs, dc, edge_crs, work, slots)
-    if changed_return or changed_pole:
-        _core._log(
-            f"[policy] return-lane-adjusted={changed_return}; pole-landing-adjusted={changed_pole}; "
-            f"main-lane-priority=ON; ordinary-pole-exclusive=ON"
-        )
-    return edge_crs, work, ordered, routes, slots
 
 
 def install():
     global _INSTALLED
     if _INSTALLED:
         return
-    _core._set_flags = _patched_set_flags
+    _core._set_flags = _set_flags
     _core._plan = _patched_plan
     _core._geometry = _return_anchored_geometry
     _INSTALLED = True
     _core._log(
-        "[policy] Return + Pole Landing rules installed; "
-        "return=FAT_START/SAME_POLE_EDGE_CHAIN_REVERSED; "
-        "return-end=FAR_POLE; return-spacing=0.50m; "
-        "main-lane-first=ON; ordinary-pole-exclusive=ON"
+        "[POLICY] unified-lane-state installed; main=stable-owner/free-slot0; "
+        "side=sticky-sign; order=group-outside; compact=same-side-only; "
+        "return=topology-derived"
     )
 
 
