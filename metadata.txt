@@ -1,0 +1,19 @@
+[general]
+name=ODN Tools Pro
+qgisMinimumVersion=3.40
+description=ODN/FTTH project management and network link design tools
+author=YUAN
+version=2.0.2
+about=Project-driven ODN/FTTH tools. All operational layers are resolved from the active ODN Project. Includes Project Management, Project Configuration, Pole Trace Connection, Overlength Pole Insertion and interactive Link Design. Historical Scheme 3 scaffolding has been removed; physical routing is now a reusable ODN Project service.
+category=Vector
+icon=icons/odn_tools_pro.svg
+experimental=False
+deprecated=False
+hasProcessingProvider=no
+server=False
+tags=ODN, FTTH, telecom, fiber, FAT, FDT, pole, trace, connect, link design, project
+homepage=https://github.com/wangyangyuan18-design/ODN_Tools_Pro
+repository=https://github.com/wangyangyuan18-design/ODN_Tools_Pro
+tracker=https://github.com/wangyangyuan18-design/ODN_Tools_Pro/issues
+# Automated package-build trigger; the visible plugin version remains 2.0.2.
+# Rebuild after corrected DAR463 FAT trace.
