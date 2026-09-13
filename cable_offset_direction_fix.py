@@ -5,16 +5,17 @@ Canonical Pole Edge identity is intentionally directionless. This module
 keeps that identity for lane allocation but restores the actual route
 orientation whenever side hints or corner geometry are calculated.
 
-This module also installs a compact diagnostic logger. Diagnostic identity is
-preserved, but verbose coordinates and repeated geometry arrays are replaced
-by short stable point IDs or counts so test logs remain practical to paste.
+The module also installs a compact diagnostic logger. Diagnostic identity is
+preserved, while verbose coordinates and repeated geometry arrays are reduced
+to stable IDs/counts. Lane planning is audited after the authoritative planner
+returns, so the diagnostic layer does not change allocation behaviour.
 """
 
 from hashlib import sha1
 from math import hypot
 import re
 
-from qgis.core import QgsPointXY, Qgis
+from qgis.core import QgsGeometry, QgsPointXY, Qgis
 
 from . import cable_offset_core as _core
 from . import cable_offset_layout as _base
@@ -22,6 +23,10 @@ from . import cable_offset_layout as _base
 
 _PATCH_TAG = "[route-direction-fix]"
 _COORD_RE = re.compile(r"\((-?\d+(?:\.\d+)?),(-?\d+(?:\.\d+)?)\)")
+_AUDIT_PENDING = None
+_AUDIT_ROUTES = None
+_AUDIT_EDGE_CRS = None
+_AUDIT_WORK_CRS = None
 
 
 def _same_point(a, b, eps=1e-6):
@@ -33,23 +38,30 @@ def _point_id_text(point_text):
     match = _COORD_RE.fullmatch(point_text.strip())
     if not match:
         return "#----"
-    # Millimetre-level detail is unnecessary for diagnostics; this keeps the
-    # identifier stable while avoiding the original long coordinate string.
     x = round(float(match.group(1)), 3)
     y = round(float(match.group(2)), 3)
     token = f"{x:.3f},{y:.3f}".encode("utf-8")
     return "#" + sha1(token).hexdigest()[:4].upper()
 
 
+def _edge_id(edge):
+    """Stable short physical-edge ID; never print endpoint coordinates."""
+    try:
+        a, b = _base._edge_points(edge)
+        pa = (round(float(a.x()), 3), round(float(a.y()), 3))
+        pb = (round(float(b.x()), 3), round(float(b.y()), 3))
+        token = repr(tuple(sorted((pa, pb)))).encode("utf-8")
+        return "#" + sha1(token).hexdigest()[:4].upper()
+    except Exception:
+        return "#----"
+
+
 def _compact_log(message, level=Qgis.Info):
-    """Compress high-volume geometry diagnostics without changing behaviour."""
+    """Compress high-volume diagnostics without changing behaviour."""
     text = str(message)
 
-    # Direction diagnostics: the useful fact is route orientation, not the
-    # full route/canonical coordinate pairs.
     if text.startswith(_PATCH_TAG):
         same = re.search(r"same=(\d)", text)
-        reversed_ = re.search(r"reversed=(\d)", text)
         direction = "SAME" if same and same.group(1) == "1" else "REVERSED"
         link = re.search(r"link=([^;]+)", text)
         segment = re.search(r"segment=([^;]+)", text)
@@ -60,9 +72,6 @@ def _compact_log(message, level=Qgis.Info):
             f"edge={edge.group(1) if edge else '?'}; direction={direction}"
         )
 
-    # Corner diagnostics: retain the decision and slot transition. Replace the
-    # node coordinate with a short stable ID and reduce the output-point list
-    # to its count.
     if text.startswith("[corner-debug]"):
         node_match = re.search(r"node=(\([^)]*\))", text)
         point_list = re.search(r"points=\[(.*?)\]; direction=", text)
@@ -82,8 +91,6 @@ def _compact_log(message, level=Qgis.Info):
             f"node={node_id}; points={point_count}; direction=ORIENTED"
         )
 
-    # Pole-landing diagnostics: preserve the slot adjustment and rule, but use
-    # a short node ID instead of a long coordinate pair.
     if text.startswith("[pole-landing-policy]"):
         node_match = re.search(r"blocked-node=(\([^)]*\))", text)
         if node_match:
@@ -101,11 +108,7 @@ _core._log = _compact_log
 
 
 def _oriented_edge(edge, node, incoming):
-    """Orient a canonical edge relative to the route node.
-
-    For an incoming edge the route is other_endpoint -> node.
-    For an outgoing edge the route is node -> other_endpoint.
-    """
+    """Orient a canonical edge relative to the route node."""
     a, b = _base._edge_points(edge)
     a = _core._tp(a, _ORIENT_EDGE_CRS, _ORIENT_WORK_CRS)
     b = _core._tp(b, _ORIENT_EDGE_CRS, _ORIENT_WORK_CRS)
@@ -119,7 +122,7 @@ def _oriented_edge(edge, node, incoming):
             return a, b
         if _same_point(b, node):
             return b, a
-    return (a, b)
+    return a, b
 
 
 _ORIENT_EDGE_CRS = None
@@ -127,10 +130,10 @@ _ORIENT_WORK_CRS = None
 
 
 def _collect_uses(designs, edge_crs, work_crs):
-    """Same planner input as the authoritative core, but side_hint is local
-    to the actual directed route edge instead of canonical A->B orientation.
-    """
+    """Use actual directed route edges for side hints while keeping physical
+    Edge identity canonical for allocation."""
     global _ORIENT_EDGE_CRS, _ORIENT_WORK_CRS
+    global _AUDIT_PENDING, _AUDIT_ROUTES, _AUDIT_EDGE_CRS, _AUDIT_WORK_CRS
     _ORIENT_EDGE_CRS = edge_crs
     _ORIENT_WORK_CRS = work_crs
 
@@ -174,7 +177,126 @@ def _collect_uses(designs, edge_crs, work_crs):
                 )
                 use.prev_edge_key = edges[edge_index - 1] if edge_index else None
                 pending.append(use)
+    _AUDIT_PENDING = pending
+    _AUDIT_ROUTES = routes
+    _AUDIT_EDGE_CRS = edge_crs
+    _AUDIT_WORK_CRS = work_crs
     return pending, routes
+
+
+def _audit_plan_result(designs, dc, edge_layer, spacing, slots):
+    """Emit one compact evidence chain for lane jumps, gaps and pole landing.
+
+    This is post-plan diagnostics only. It does not modify the returned slot map.
+    """
+    pending = _AUDIT_PENDING or []
+    edge_crs = _AUDIT_EDGE_CRS or edge_layer.crs()
+    work = _AUDIT_WORK_CRS
+    if work is None or not pending:
+        return
+
+    occupancy = _core._occupancy(dc, designs, work)
+    spatial_index, geometries = _base._build_existing_index(occupancy, work)
+    reserved_cache = {}
+
+    def reserved(edge):
+        if edge not in reserved_cache:
+            a, b = _base._edge_points(edge)
+            a = _core._tp(a, edge_crs, work)
+            b = _core._tp(b, edge_crs, work)
+            reserved_cache[edge] = _base._existing_slot_occupancy(
+                QgsGeometry.fromPolylineXY([a, b]), spacing, spatial_index, geometries
+            )
+        return set(reserved_cache[edge])
+
+    by_edge = {}
+    for use in pending:
+        by_edge.setdefault(use.edge_key, []).append(use)
+
+    # One line per physical edge. This is deliberately the main diagnostic
+    # record; individual route-direction and corner records remain separate.
+    for edge, uses in by_edge.items():
+        rsv = reserved(edge)
+        assigned = []
+        for use in uses:
+            key = (use.design_index, use.segment_index, use.edge_index)
+            chosen = int(slots.get(key, getattr(use, "slot", 0)))
+            prior = None
+            if use.edge_index > 0:
+                prior = slots.get((use.design_index, use.segment_index, use.edge_index - 1))
+            if chosen == 0:
+                source = "MAIN"
+            elif prior == chosen:
+                source = "KEEP"
+            elif prior not in (None, 0) and (1 if prior > 0 else -1) == (1 if chosen > 0 else -1):
+                source = "REPACK"
+            elif prior not in (None, 0):
+                source = "CROSS_SIDE"
+            else:
+                source = "SIDE_HINT"
+            delta = "NA" if prior is None else f"{chosen-prior:+d}"
+            assigned.append(
+                f"{use.design_index}/{use.segment_index}/{use.edge_index}:{chosen}/{delta}/{source}"
+            )
+
+        values = sorted(set(int(slots.get((u.design_index, u.segment_index, u.edge_index), getattr(u, "slot", 0))) for u in uses))
+        positive = sorted(v for v in values if v > 0)
+        negative = sorted(abs(v) for v in values if v < 0)
+        gaps = []
+        if positive:
+            missing = [str(i) for i in range(1, max(positive) + 1) if i not in positive]
+            if missing:
+                gaps.append("+" + ",".join(missing))
+        if negative:
+            missing = [str(i) for i in range(1, max(negative) + 1) if i not in negative]
+            if missing:
+                gaps.append("-" + ",".join(missing))
+
+        links = ",".join(str(designs[u.design_index].get("link", "")) for u in uses)
+        _core._log(
+            f"[edge-audit] edge={_edge_id(edge)}; links={links}; "
+            f"reserved={','.join(str(x) for x in sorted(rsv)) or 'NONE'}; "
+            f"slots={'|'.join(assigned)}; gaps={','.join(gaps) or 'NONE'}"
+        )
+
+    # Endpoint/corner landing audit: enough to tell whether a segment ends at
+    # a physical Pole or only reaches its offset lane. No coordinates are kept.
+    for design_index, design in enumerate(designs or []):
+        for segment_index, segment in enumerate(design.get("segments", []) or []):
+            edges = [e for raw in segment.get("edge_sequence", []) or [] if (e := _base._canonical_edge(raw))]
+            if not edges:
+                continue
+            nodes = _base._extract_route_graph_nodes(segment, work, edge_crs, edge_crs)
+            if len(nodes) != len(edges) + 1:
+                continue
+            first_slot = int(slots.get((design_index, segment_index, 0), 0))
+            last_slot = int(slots.get((design_index, segment_index, len(edges)-1), 0))
+            start_physical = bool(segment.get("_odn_special_start")) or first_slot == 0
+            end_physical = bool(segment.get("_odn_special_end")) or last_slot == 0
+            _core._log(
+                f"[pole-audit] link={design.get('link','')}; segment={segment_index}; "
+                f"start={'PHYSICAL' if start_physical else 'OFFSET'}; "
+                f"end={'PHYSICAL' if end_physical else 'OFFSET'}; "
+                f"start_slot={first_slot}; end_slot={last_slot}"
+            )
+
+    _core._log(
+        f"[audit-summary] edges={len(by_edge)}; "
+        f"note=EDGE(slot/delta/source/reserved/gap)+POLE(start/end)"
+    )
+
+
+_ORIGINAL_PLAN = _core._plan
+
+
+def _plan_with_audit(designs, dc, edge_layer, spacing):
+    result = _ORIGINAL_PLAN(designs, dc, edge_layer, spacing)
+    try:
+        _audit_plan_result(designs, dc, edge_layer, spacing, result[-1])
+    except Exception as exc:
+        # Diagnostics must never break production design.
+        _ORIGINAL_LOG(f"[audit-warning] {type(exc).__name__}: {exc}", Qgis.Warning)
+    return result
 
 
 def _build_corner_geometry(node, in_edge, out_edge, prev_slot, next_slot, spacing, return_context=False):
@@ -213,7 +335,8 @@ def _build_corner_geometry(node, in_edge, out_edge, prev_slot, next_slot, spacin
     return decision, points
 
 
-# Install only these two seams. All D/E/F primitives remain in the existing
-# authoritative core; this patch only changes the direction supplied to them.
+# Install the direction and diagnostic seams. The authoritative allocation and
+# geometry algorithms remain unchanged.
 _core._collect_uses = _collect_uses
 _core._build_corner_geometry = _build_corner_geometry
+_core._plan = _plan_with_audit
