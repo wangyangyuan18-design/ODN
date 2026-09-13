@@ -1,0 +1,1 @@
+FAT trace build-ready patch context. This file is a manual build/verification marker for the FAT trace diagnostic patch.
