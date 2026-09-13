@@ -2,8 +2,8 @@
 """ODN Project physical-route services.
 
 The active ODN Project is the sole source of operational layers and semantic
-field bindings.  This module provides reusable Pole Edge routing services to
-Link Design and future ODN functions.
+field bindings. This module provides reusable Pole Edge routing services to
+Link Design and ODN 2.1 planning.
 """
 from collections import defaultdict
 from heapq import heappop, heappush
@@ -16,7 +16,6 @@ from qgis.core import (
 
 
 def project_layer(payload, role):
-    """Return the QGIS layer bound to an ODN Project role."""
     entry = (payload or {}).get("layer_registry", {}).get(role, {})
     return QgsProject.instance().mapLayer(entry.get("layer_id", ""))
 
@@ -47,7 +46,6 @@ def _turn_angle_deg(prev_point, node_point, next_point):
 
 
 def feature_name(payload, layer, role, feature):
-    """Resolve a feature's display name from the project's field registry."""
     mapping = (payload or {}).get("field_registry", {}).get(role, {})
     configured = mapping.get("名称")
     if configured and configured in layer.fields().names():
@@ -63,12 +61,6 @@ def feature_name(payload, layer, role, feature):
 class OdnProjectRouteEngine:
     """Weighted Pole Edge route engine with engineering continuity preference."""
 
-    # These are route-selection preferences, not physical cable offsets.
-    # Distance remains the dominant base cost; a turn is penalized so a nearly
-    # equal path with fewer turns is preferred, and an immediate/U-turn-like
-    # reversal receives a much larger penalty. This directly reduces routes
-    # such as A -> pole -> back along the same corridor -> turn left when a
-    # clean alternative path exists.
     TURN_PENALTY_M = 15.0
     REVERSAL_PENALTY_M = 150.0
 
@@ -103,11 +95,9 @@ class OdnProjectRouteEngine:
         )
 
     def _measure(self, geometry):
-        """Measure geometry in meters regardless of the Pole Edge CRS units."""
         distance = QgsDistanceArea()
         crs = self.edge_layer.crs()
         distance.setSourceCrs(crs, self.project.transformContext())
-
         try:
             ellipsoid = crs.ellipsoidAcronym()
         except Exception:
@@ -118,16 +108,9 @@ class OdnProjectRouteEngine:
             distance.setEllipsoid(str(ellipsoid))
         except Exception:
             distance.setEllipsoid("WGS84")
-
         measured = float(distance.measureLength(geometry) or 0.0)
         try:
-            return float(
-                distance.convertLengthMeasurement(
-                    measured,
-                    distance.lengthUnits(),
-                    QgsUnitTypes.DistanceMeters,
-                )
-            )
+            return float(distance.convertLengthMeasurement(measured, distance.lengthUnits(), QgsUnitTypes.DistanceMeters))
         except Exception:
             return measured
 
@@ -157,7 +140,15 @@ class OdnProjectRouteEngine:
                     self.node_points[end] = QgsPointXY(b)
 
     def _index_design_points(self):
-        for role, typ in (("FDT", "FDT"), ("FAT", "FAT")):
+        # FDT/FAT are normal Link Design nodes. BB/SFC CL are generated ODN 2.1
+        # nodes and must also be routable after they enter a saved sequence.
+        roles = (
+            ("FDT", "FDT"),
+            ("FAT", "FAT"),
+            ("BB", "BB"),
+            ("SFC CL", "SFC CL"),
+        )
+        for role, typ in roles:
             layer = project_layer(self.payload, role)
             if layer is None:
                 continue
@@ -190,21 +181,16 @@ class OdnProjectRouteEngine:
         point = QgsPointXY(info["point"])
         source, target = info["layer"].crs(), self.edge_layer.crs()
         if source != target:
-            point = QgsCoordinateTransform(
-                source, target, self.project.transformContext()
-            ).transform(point)
+            point = QgsCoordinateTransform(source, target, self.project.transformContext()).transform(point)
         return point
 
     def _point_distance(self, a, b):
-        return self._measure(
-            QgsGeometry.fromPolylineXY([QgsPointXY(a), QgsPointXY(b)])
-        )
+        return self._measure(QgsGeometry.fromPolylineXY([QgsPointXY(a), QgsPointXY(b)]))
 
     def attach(self, typ, feature_id):
         _, info = self.point_by_id(typ, feature_id)
         if info is None or not self.node_points:
             return None
-
         point = self._point_in_edge_crs(info)
         best = None
         for node, node_point in self.node_points.items():
@@ -223,7 +209,6 @@ class OdnProjectRouteEngine:
         }
 
     def _route_with_engineering_preference(self, start_node, end_node):
-        """Shortest path plus turn/reversal preferences using expanded state."""
         start_state = (start_node, None)
         best_score = {start_state: 0.0}
         best_distance = {start_state: 0.0}
@@ -236,16 +221,13 @@ class OdnProjectRouteEngine:
             state = (node, prev_node)
             if score > best_score.get(state, inf) + 1e-9:
                 continue
-            if abs(score - best_score.get(state, inf)) <= 1e-9:
-                if traveled > best_distance.get(state, inf) + 1e-9:
-                    continue
-
+            if abs(score - best_score.get(state, inf)) <= 1e-9 and traveled > best_distance.get(state, inf) + 1e-9:
+                continue
             if node == end_node:
                 target_state = state
                 break
 
             for neighbour, weight, edge_id in self.graph.get(node, []):
-                angle = 0.0
                 turn_penalty = 0.0
                 reversal_penalty = 0.0
                 is_turn = 0
@@ -264,29 +246,13 @@ class OdnProjectRouteEngine:
                 new_turn_count = turn_count + is_turn
                 new_score = new_traveled + turn_penalty + reversal_penalty
                 new_state = (neighbour, node)
-
                 old_score = best_score.get(new_state, inf)
                 old_distance = best_distance.get(new_state, inf)
-                if (
-                    new_score < old_score - 1e-9
-                    or (
-                        abs(new_score - old_score) <= 1e-9
-                        and new_traveled < old_distance - 1e-9
-                    )
-                ):
+                if new_score < old_score - 1e-9 or (abs(new_score - old_score) <= 1e-9 and new_traveled < old_distance - 1e-9):
                     best_score[new_state] = new_score
                     best_distance[new_state] = new_traveled
                     previous[new_state] = (state, edge_id)
-                    heappush(
-                        heap,
-                        (
-                            new_score,
-                            new_traveled,
-                            new_turn_count,
-                            neighbour,
-                            node,
-                        ),
-                    )
+                    heappush(heap, (new_score, new_traveled, new_turn_count, neighbour, node))
 
         if target_state is None:
             return None, None, None, None
@@ -303,23 +269,20 @@ class OdnProjectRouteEngine:
         graph_nodes.reverse()
         edge_sequence.reverse()
 
-        final_score = best_score.get(target_state, 0.0)
-        final_distance = best_distance.get(target_state, 0.0)
-        return graph_nodes, edge_sequence, final_distance, final_score
+        return (
+            graph_nodes,
+            edge_sequence,
+            best_distance.get(target_state, 0.0),
+            best_score.get(target_state, 0.0),
+        )
 
     def route(self, start_typ, start_id, end_typ, end_id):
         start = self.attach(start_typ, start_id)
         end = self.attach(end_typ, end_id)
         if not start or not end:
             return None
-
         start_node, end_node = start["node"], end["node"]
-        (
-            graph_nodes,
-            edge_sequence,
-            pole_edge_distance,
-            route_score,
-        ) = self._route_with_engineering_preference(start_node, end_node)
+        graph_nodes, edge_sequence, pole_edge_distance, route_score = self._route_with_engineering_preference(start_node, end_node)
         if graph_nodes is None:
             return None
 
