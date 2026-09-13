@@ -1,19 +1,14 @@
 # -*- coding: utf-8 -*-
 """Authoritative ODN 2.1 BB / SFC CL planning.
 
-ODN 2.1 has exactly two fixed physical planning rules:
+Fixed rules:
+- BB: return cable = defined start-to-end Pole Edge distance * 2. If >100 m,
+  put BB at that defined return endpoint.
+- SFC CL: start from the segment's start/aggregation point, walk pole by pole,
+  and put SFC CL at the last pole whose cumulative distance is <=455 m before
+  the next pole would exceed 455 m. The next segment starts there.
 
-* BB: return cable is the same Pole Edge traversed out and back. If the
-  defined start-to-end Pole Edge distance * 2 is > 100 m, put BB at the
-  previously defined return endpoint.
-* SFC CL: every segment starts at its ODN node / aggregation point. Walk pole
-  by pole from that start. When the next pole would make the cumulative
-  distance > 455 m, step back to the last pole whose cumulative distance is
-  <= 455 m and put SFC CL there. The next segment starts from that SFC CL.
-
-There is no candidate scoring, no alternative threshold source and no change
-inside Offset Core. BB and SFC CL are real ODN nodes and therefore become part
-of the authoritative Link sequence before Offset Core runs.
+No candidate scoring, no alternative thresholds, and no changes to Offset Core.
 """
 
 from math import inf
@@ -225,26 +220,19 @@ def _rebuild(controller, sequence, engine):
 
 
 def _last_pole_at_limit(segment, engine):
-    """Walk from segment start; return last pole whose cumulative distance <=455m."""
+    """Walk from the segment start; return last pole whose cumulative <=455m."""
     nodes = list(segment.get("graph_nodes") or [])
     edges = list(segment.get("edge_sequence") or [])
     if len(nodes) < 2 or len(edges) != len(nodes) - 1:
         return None
-
     cumulative = float(segment.get("start_connector", 0.0) or 0.0)
     candidate = None
     for index, edge in enumerate(edges):
         next_distance = cumulative + _edge_length(engine, edge)
         if next_distance <= SFC_LIMIT_M + 1e-6:
-            candidate = {
-                "node_index": index + 1,
-                "distance": next_distance,
-                "node": nodes[index + 1],
-            }
+            candidate = {"node_index": index + 1, "distance": next_distance, "node": nodes[index + 1]}
             cumulative = next_distance
             continue
-        # The next pole is over the limit: the immediately previous legal pole
-        # is the fixed SFC CL position.
         break
     return candidate
 
@@ -289,7 +277,6 @@ def _insert_sfc(payload, engine, design, segment_index, segment, serial):
     length = float(segment.get("distance", 0.0) or 0.0)
     if length <= SFC_LIMIT_M + 1e-6:
         return None, serial
-
     candidate = _last_pole_at_limit(segment, engine)
     if candidate is None:
         _log(
@@ -299,9 +286,8 @@ def _insert_sfc(payload, engine, design, segment_index, segment, serial):
         )
         raise RuntimeError(
             f"{design.get('fdt')}/{design.get('link')} 第 {segment_index + 1} 段超过 {SFC_LIMIT_M:g}m，"
-            "且从该段起点到下一根杆之前没有任何累计距离 <=455m 的可放置 SFC CL 杆。"
+            "且从该段起点开始没有任何累计距离 <=455m 的可放置 SFC CL 杆。"
         )
-
     node = candidate["node"]
     point = engine.node_points[node]
     name = _new_name(design, "SFC_CL", serial)
@@ -315,13 +301,13 @@ def _insert_sfc(payload, engine, design, segment_index, segment, serial):
     return (candidate["node_index"], ("SFC CL", fid, label)), serial + 1
 
 
-def _apply_insertions(sequence, insertion_by_segment):
-    """Insert each node between the segment start and segment end."""
+def _apply_insertion(sequence, segment_index, insertion):
+    if insertion is None:
+        return sequence
     result = []
-    for segment_index, item in enumerate(sequence[:-1]):
+    for index, item in enumerate(sequence[:-1]):
         result.append(item)
-        insertion = insertion_by_segment.get(segment_index)
-        if insertion:
+        if index == segment_index:
             _, node_item = insertion
             if result[-1][:2] != node_item[:2]:
                 result.append(node_item)
@@ -348,7 +334,6 @@ def plan_design(controller, design):
     if not raw_ids or len(raw_ids) != len(raw_labels):
         raise RuntimeError("ODN 2.1 自动规划需要完整的 sequence_ids / sequence。")
     sequence = [(str(item[0]), int(item[1]), str(raw_labels[i])) for i, item in enumerate(raw_ids)]
-
     engine = OdnProjectRouteEngine(
         controller.iface,
         payload,
@@ -360,44 +345,35 @@ def plan_design(controller, design):
     for _ in range(MAX_ITERATIONS):
         segments = _rebuild(controller, sequence, engine)
 
+        insertion = None
         if bb_on:
             for segment_index, segment in enumerate(segments):
-                insertion, serial_bb_next = _insert_bb(
-                    payload, engine, design, segment_index, segment, serial_bb
-                )
+                insertion, serial_next = _insert_bb(payload, engine, design, segment_index, segment, serial_bb)
                 if insertion is not None:
-                    sequence = _apply_insertions(
-                        sequence,
-                        {segment_index: insertion},
-                    )
-                    serial_bb = serial_bb_next
+                    sequence = _apply_insertion(sequence, segment_index, insertion)
+                    serial_bb = serial_next
                     engine = OdnProjectRouteEngine(
                         controller.iface,
                         payload,
                         max(0.01, float((payload.get("parameters") or {}).get("fat_pole_max_distance", 3.0) or 3.0)),
                     )
                     break
-            else:
-                pass
             if insertion is not None:
                 continue
 
+        insertion = None
         if sfc_on:
             for segment_index, segment in enumerate(segments):
-                insertion, serial_sfc_next = _insert_sfc(
-                    payload, engine, design, segment_index, segment, serial_sfc
-                )
+                insertion, serial_next = _insert_sfc(payload, engine, design, segment_index, segment, serial_sfc)
                 if insertion is not None:
-                    sequence = _apply_insertions(sequence, {segment_index: insertion})
-                    serial_sfc = serial_sfc_next
+                    sequence = _apply_insertion(sequence, segment_index, insertion)
+                    serial_sfc = serial_next
                     engine = OdnProjectRouteEngine(
                         controller.iface,
                         payload,
                         max(0.01, float((payload.get("parameters") or {}).get("fat_pole_max_distance", 3.0) or 3.0)),
                     )
                     break
-            else:
-                insertion = None
             if insertion is not None:
                 continue
 
@@ -423,17 +399,14 @@ def plan_design(controller, design):
 
 
 def install():
-    """Install ODN 2.1 planning before Link Design save runs."""
     try:
         from . import link_design_core
         controller_cls = link_design_core.LinkDesignController
     except Exception as exc:
         _log(f"[INSTALL FAIL] 无法加载 Link Design Core：{exc}", Qgis.Critical)
         return False
-
     if getattr(controller_cls, "_odn21_planning_installed", False):
         return True
-
     original = controller_cls._make_design
 
     def wrapped(self):
