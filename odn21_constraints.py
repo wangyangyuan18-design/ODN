@@ -1,23 +1,17 @@
 # -*- coding: utf-8 -*-
 """ODN 2.1 planning diagnostics.
 
-Authoritative engineering limits for ODN 2.1:
-- Return cable: repeated physical Pole Edge out-and-back, one-way length * 2.
-- BB trigger: return length > 100 m.
-- Distribution / pre-link cable: every individual ODN-node-to-ODN-node segment
-  must be <= 455 m; an SFC Closure is placed at the last real Pole node that
-  stays within 455 m from that segment's start.
-
-The actual automatic insertion is performed by ``odn21_planning.py``.  This
-module keeps the diagnostic view consistent with the same rules.
+These are fixed engineering rules. There is intentionally no parameter or UI
+entry that can override them:
+- BB: return length > 100 m.
+- SFC CL: every individual segment <= 455 m.
 """
 
 from qgis.core import QgsMessageLog, Qgis
 
 _LOG_TAG = "ODN_Tools_Pro / ODN 2.1"
-DEFAULT_RETURN_LIMIT_M = 100.0
-DEFAULT_BB_TRIGGER_M = 100.0
-DEFAULT_DC_LIMIT_M = 455.0
+RETURN_LIMIT_M = 100.0
+SFC_LIMIT_M = 455.0
 
 
 def _log(message, level=Qgis.Info):
@@ -25,25 +19,6 @@ def _log(message, level=Qgis.Info):
         QgsMessageLog.logMessage(str(message), _LOG_TAG, level)
     except Exception:
         pass
-
-
-def _parameters(payload):
-    return (payload or {}).get("parameters") or {}
-
-
-def _number(payload, names, default):
-    params = _parameters(payload)
-    for name in names:
-        value = params.get(name)
-        if value in (None, ""):
-            continue
-        try:
-            value = float(value)
-            if value > 0:
-                return value
-        except (TypeError, ValueError):
-            continue
-    return float(default)
 
 
 def is_odn21(payload):
@@ -65,23 +40,12 @@ def enabled(payload, role):
     return False
 
 
-def limits(payload):
+def limits(payload=None):
+    """Return the only authoritative ODN 2.1 limits."""
     return {
-        "return_cable": _number(
-            payload,
-            ("return_cable_max_distance", "return_cable_limit", "back_cable_max_distance", "back_cable_limit"),
-            DEFAULT_RETURN_LIMIT_M,
-        ),
-        "bb_trigger": _number(
-            payload,
-            ("bb_trigger_distance", "bb_return_cable_trigger", "bb_limit", "bb_return_threshold"),
-            DEFAULT_BB_TRIGGER_M,
-        ),
-        "dc": _number(
-            payload,
-            ("prelinked_cable_max_length", "pre_linked_cable_max_length", "dc_cable_max_length", "optical_cable_max_length"),
-            DEFAULT_DC_LIMIT_M,
-        ),
+        "return_cable": RETURN_LIMIT_M,
+        "bb_trigger": RETURN_LIMIT_M,
+        "dc": SFC_LIMIT_M,
     }
 
 
@@ -104,7 +68,7 @@ def _edge_length(engine, edge):
 
 
 def _return_loops(segment):
-    """Return repeated physical-edge traversals and the defined return endpoint."""
+    """Return repeated physical-edge traversals and their defined endpoint."""
     edges = list(segment.get("edge_sequence") or [])
     nodes = list(segment.get("graph_nodes") or [])
     first_seen = {}
@@ -126,7 +90,7 @@ def _return_loops(segment):
     return loops
 
 
-def _last_pole_at_limit(segment, engine, limit):
+def _last_pole_at_limit(segment, engine):
     nodes = list(segment.get("graph_nodes") or [])
     edges = list(segment.get("edge_sequence") or [])
     if len(nodes) < 2 or len(edges) != len(nodes) - 1:
@@ -135,12 +99,8 @@ def _last_pole_at_limit(segment, engine, limit):
     candidate = None
     for i, edge in enumerate(edges):
         nxt = cumulative + _edge_length(engine, edge)
-        if nxt <= limit + 1e-6:
-            candidate = {
-                "node_index": i + 1,
-                "distance": nxt,
-                "point": nodes[i + 1],
-            }
+        if nxt <= SFC_LIMIT_M + 1e-6:
+            candidate = {"node_index": i + 1, "distance": nxt, "point": nodes[i + 1]}
             cumulative = nxt
         else:
             break
@@ -150,13 +110,13 @@ def _last_pole_at_limit(segment, engine, limit):
 def analyze_designs(designs, engine, payload):
     if not is_odn21(payload):
         return {"enabled": False, "bb": [], "sfc": [], "violations": []}
-    lim = limits(payload)
+    lim = limits()
     result = {"enabled": True, "limits": lim, "bb": [], "sfc": [], "violations": []}
     bb_on = enabled(payload, "BB")
     sfc_on = enabled(payload, "SFC CL")
     _log(
         f"[ODN2.1 START] designs={len(designs or [])}; BB={int(bb_on)}; SFC Closure={int(sfc_on)}; "
-        f"return_limit={lim['return_cable']:.3f}m; BB_trigger={lim['bb_trigger']:.3f}m; DC_limit={lim['dc']:.3f}m"
+        f"return_limit={RETURN_LIMIT_M:.3f}m; SFC_limit={SFC_LIMIT_M:.3f}m"
     )
 
     for di, design in enumerate(designs or []):
@@ -172,21 +132,21 @@ def analyze_designs(designs, engine, payload):
                         "one_way": one_way,
                         "return_length": ret,
                         "return_endpoint": loop["return_endpoint"],
-                        "needs_bb": ret > lim["bb_trigger"],
+                        "needs_bb": ret > RETURN_LIMIT_M,
                     }
                     result["bb"].append(item)
                     _log(
-                        f"[BB CHECK] design={di}; segment={si + 1}; one_way={one_way:.3f}m; "
-                        f"return={ret:.3f}m; trigger={lim['bb_trigger']:.3f}m; "
-                        f"needs_bb={int(item['needs_bb'])}; return_endpoint={loop['return_endpoint']}"
+                        f"[BB CHECK] design={di}; segment={si + 1}; "
+                        f"start_end_pole_edge={one_way:.3f}m; return={ret:.3f}m; "
+                        f"endpoint={loop['return_endpoint']}; needs_bb={int(item['needs_bb'])}"
                     )
                     if item["needs_bb"]:
                         result["violations"].append(("BB", di, si, item))
 
             if sfc_on:
                 distance = float(segment.get("distance", 0.0) or 0.0)
-                if distance > lim["dc"] + 1e-6:
-                    candidate = _last_pole_at_limit(segment, engine, lim["dc"])
+                if distance > SFC_LIMIT_M:
+                    candidate = _last_pole_at_limit(segment, engine)
                     item = {
                         "design": di,
                         "segment": si,
@@ -197,13 +157,13 @@ def analyze_designs(designs, engine, payload):
                     if candidate:
                         _log(
                             f"[SFC CHECK] design={di}; segment={si + 1}; length={distance:.3f}m; "
-                            f"limit={lim['dc']:.3f}m; selected_node={candidate['node_index']}; "
-                            f"selected_distance={candidate['distance']:.3f}m"
+                            f"limit={SFC_LIMIT_M:.3f}m; selected_distance={candidate['distance']:.3f}m; "
+                            f"node={candidate['point']}"
                         )
                     else:
                         _log(
                             f"[SFC CHECK] design={di}; segment={si + 1}; length={distance:.3f}m; "
-                            f"limit={lim['dc']:.3f}m; NO NODE <= LIMIT",
+                            f"limit={SFC_LIMIT_M:.3f}m; NO NODE <= LIMIT",
                             Qgis.Warning,
                         )
                     result["violations"].append(("SFC Closure", di, si, item))
