@@ -1,12 +1,13 @@
 # -*- coding: utf-8 -*-
-"""Reliable Link Design change detection.
+"""Authoritative Link Design change detection.
 
-Design rule:
-1. Never repair individual route segments.
-2. Re-run every saved Link against the current FDT/FAT/Pole Edge data.
-3. Compare the newly calculated complete Link with the last confirmed snapshot.
-4. Only Links whose complete result changed are proposed for confirmation.
-5. Keep the saved FAT order; a missing FAT is removed from that saved sequence.
+Every detection run recalculates every saved Link from the current source data.
+ODN 2.1 BB/SFC CL planning is part of that rerun, so an older plan is upgraded
+through the same rules automatically.
+
+When the user confirms changes, the plugin writes the NEW Distribution Cable
+features. It deliberately does NOT delete the user's existing Distribution
+Cable; old DC cleanup is a manual user action.
 """
 
 import copy
@@ -18,11 +19,13 @@ from qgis.core import QgsDistanceArea, QgsGeometry, QgsPointXY, QgsProject
 
 from . import change_detection as _cd
 from . import link_design_v9 as _v9
+from . import odn21_planning
 from . import odn_project_context as context
 
 SNAPSHOT_KEY_PREFIX = "ODNToolsPro/LinkDesign/change_snapshot_v2/"
 POINT_TOLERANCE_M = 0.05
 GEOMETRY_TOLERANCE_M = 0.20
+AUTO_NODE_TYPES = {"BB", "SFC CL"}
 
 
 def _project_key():
@@ -50,10 +53,10 @@ def _feature_point(layer, fid):
     if layer is None:
         return None
     try:
-        f = layer.getFeature(int(fid))
-        if not f.isValid() or f.geometry().isEmpty():
+        feature = layer.getFeature(int(fid))
+        if not feature.isValid() or feature.geometry().isEmpty():
             return None
-        return QgsPointXY(f.geometry().asPoint())
+        return QgsPointXY(feature.geometry().asPoint())
     except Exception:
         return None
 
@@ -73,7 +76,6 @@ def _distance_m(a, b, crs):
 
 
 def _snapshot_from_saved_designs(controller):
-    """Use persisted Link routes as the historical baseline on first use."""
     snapshot = {"version": 2, "designs": {}}
     for design in getattr(controller, "_designs", []) or []:
         if not design.get("segments"):
@@ -85,20 +87,20 @@ def _snapshot_from_saved_designs(controller):
             "segments": [_cd._route_signature(s) for s in design.get("segments", [])],
             "node_positions": {},
         }
-        seq = [(str(x[0]), int(x[1])) for x in design.get("sequence_ids", []) or [] if len(x) >= 2]
-        segments = entry["segments"]
-        for i, (typ, fid) in enumerate(seq):
+        for i, item in enumerate(design.get("sequence_ids", []) or []):
+            if len(item) < 2 or i >= len(design.get("segments", []) or []) + 1:
+                continue
+            typ, fid = str(item[0]), int(item[1])
             pts = []
+            segments = entry["segments"]
             if i == 0 and segments:
                 pts = segments[0].get("points", []) or []
-                pt = pts[0] if pts else None
             elif i > 0 and i - 1 < len(segments):
                 pts = segments[i - 1].get("points", []) or []
-                pt = pts[-1] if pts else None
-            else:
-                pt = None
-            if pt is not None and len(pt) >= 2:
-                entry["node_positions"][f"{typ}:{fid}"] = [float(pt[0]), float(pt[1])]
+            if pts:
+                pt = pts[0] if i == 0 else pts[-1]
+                if len(pt) >= 2:
+                    entry["node_positions"][f"{typ}:{fid}"] = [float(pt[0]), float(pt[1])]
         snapshot["designs"][f"{design.get('fdt','')}/{design.get('link','')}"] = entry
     return snapshot
 
@@ -138,7 +140,11 @@ def _route_to_segment(route):
         "to": str(route.get("to_label", "")),
         "distance": round(float(route.get("distance", 0.0)), 3),
         "pole_edge_distance": round(float(route.get("pole_edge_distance", 0.0)), 3),
+        "edge_sequence": list(route.get("edge_sequence", []) or []),
         "edge_count": len(route.get("edge_sequence", [])),
+        "graph_nodes": list(route.get("graph_nodes", []) or []),
+        "start_connector": round(float(route.get("start_connector", 0.0) or 0.0), 3),
+        "end_connector": round(float(route.get("end_connector", 0.0) or 0.0), 3),
         "points": [[float(p.x()), float(p.y())] for p in route.get("points", [])],
     }
 
@@ -170,45 +176,59 @@ def _labels_for_sequence(design, sequence):
     return labels
 
 
-def _full_rerun(controller, design, fdt_layer, fat_layer, engine):
-    seq = [(str(x[0]), int(x[1])) for x in design.get("sequence_ids", []) or [] if len(x) >= 2]
-    if not seq:
-        return None, "没有保存的 Link 顺序。", None
+def _layer_for_type(payload, typ):
+    return context.project_layer(payload, typ)
 
-    # Preserve topology/order. A deleted FAT is the only automatic sequence edit.
+
+def _clean_source_sequence(controller, design, payload):
+    """Keep source nodes, remove generated BB/SFC nodes before fresh planning."""
+    sequence = [(str(x[0]), int(x[1])) for x in design.get("sequence_ids", []) or [] if len(x) >= 2]
+    fdt_layer = _layer_for_type(payload, "FDT")
+    fat_layer = _layer_for_type(payload, "FAT")
     cleaned = []
     deleted_fats = []
-    for typ, fid in seq:
+    for typ, fid in sequence:
+        if typ in AUTO_NODE_TYPES:
+            continue
         layer = fdt_layer if typ == "FDT" else fat_layer if typ == "FAT" else None
         point = _feature_point(layer, fid)
         if point is None:
             if typ == "FAT":
                 deleted_fats.append(fid)
                 continue
-            return None, f"{typ}{fid} 已不存在，无法重新计算该 Link。", {"unrepairable": True}
+            raise RuntimeError(f"{typ}{fid} 已不存在，无法重新计算该 Link。")
         cleaned.append((typ, fid))
-
     if not any(typ == "FAT" for typ, _ in cleaned):
-        return None, "删除 FAT 后该 Link 已没有剩余 FAT。", {"unrepairable": True}
+        raise RuntimeError("删除 FAT 后该 Link 已没有剩余 FAT。")
+    return cleaned, deleted_fats
+
+
+def _full_rerun(controller, design):
+    """Re-run a saved Link completely, including ODN 2.1 planning."""
+    payload = _v9._fresh_payload(controller)
+    controller._engine = None
+    engine = controller._prepare_engine()
+    if engine is None:
+        return None, "当前无法建立最新 Pole Edge 路由引擎。", {"unrepairable": True}
+
+    cleaned, deleted_fats = _clean_source_sequence(controller, design, payload)
+    labels = _labels_for_sequence(design, cleaned)
+    proposed = copy.deepcopy(design)
+    proposed["sequence_ids"] = [(typ, fid) for typ, fid in cleaned]
+    proposed["sequence"] = [labels.get((typ, fid), str(fid)) for typ, fid in cleaned]
+    proposed["nodes"] = [(fid, labels.get(("FAT", fid), str(fid))) for typ, fid in cleaned if typ == "FAT"]
 
     routes = []
     for first, second in zip(cleaned[:-1], cleaned[1:]):
-        try:
-            route = engine.route(first[0], first[1], second[0], second[1])
-        except Exception:
-            route = None
+        route = engine.route(first[0], first[1], second[0], second[1])
         if route is None:
             return None, f"{first[0]}{first[1]} → {second[0]}{second[1]} 无法沿当前 Pole Edge 建立路径。", {"unrepairable": True}
         routes.append(route)
 
-    labels = _labels_for_sequence(design, seq)
-    proposed = copy.deepcopy(design)
-    proposed["sequence_ids"] = [[typ, int(fid)] for typ, fid in cleaned]
-    proposed["sequence"] = [labels.get((typ, fid), str(fid)) for typ, fid in cleaned]
-    proposed["nodes"] = [[fid, labels.get((typ, fid), str(fid))] for typ, fid in cleaned if typ == "FAT"]
-    proposed["segments"] = [_route_to_segment(r) for r in routes]
+    proposed["segments"] = [_route_to_segment(route) for route in routes]
     proposed["length"] = round(sum(float(r.get("distance", 0.0)) for r in routes), 3)
     proposed["written"] = False
+    proposed["written_fids"] = []
     proposed["needs_resync"] = True
     proposed["_resync_source"] = {
         "fdt": design.get("fdt", ""),
@@ -216,21 +236,25 @@ def _full_rerun(controller, design, fdt_layer, fat_layer, engine):
         "source_crs": design.get("source_crs", ""),
         "segments": copy.deepcopy(design.get("segments", []) or []),
     }
-    return proposed, None, {"deleted_fats": deleted_fats}
+
+    # One and only one ODN 2.1 planning stage, shared with normal Link Design save.
+    try:
+        planned = odn21_planning.plan_design(controller, proposed)
+    except Exception as exc:
+        return None, str(exc), {"unrepairable": True}
+
+    return planned, None, {
+        "deleted_fats": deleted_fats,
+        "ran": True,
+        "odn21": bool(odn21_planning._is_21(payload)),
+    }
 
 
 def detect_changes(controller):
-    """Full-rerun comparison. No Link mutation occurs during detection."""
+    """Always fully rerun every saved Link, then compare the complete result."""
     baseline = _ensure_baseline(controller)
-    payload = _v9._fresh_payload(controller)
-    fdt_layer = context.project_layer(payload, "FDT")
-    fat_layer = context.project_layer(payload, "FAT")
-    controller._engine = None
-    engine = controller._prepare_engine()
-    if engine is None:
-        return {"snapshot": baseline, "changes": [], "error": "当前无法建立 Pole Edge 路由引擎。"}
-
     changes = []
+
     for index, design in enumerate(getattr(controller, "_designs", []) or []):
         if not design.get("segments"):
             continue
@@ -238,7 +262,8 @@ def detect_changes(controller):
         base = baseline.get("designs", {}).get(key)
         if not base:
             continue
-        proposed, error, meta = _full_rerun(controller, design, fdt_layer, fat_layer, engine)
+
+        proposed, error, meta = _full_rerun(controller, design)
         if proposed is None:
             changes.append({
                 "key": key,
@@ -257,53 +282,66 @@ def detect_changes(controller):
         if meta.get("deleted_fats"):
             changed = True
             reasons.append("FAT 删除")
-        if not changed:
-            old_segments = base.get("segments", []) or []
-            new_segments = proposed.get("segments", []) or []
-            if len(old_segments) != len(new_segments):
-                changed = True
-                reasons.append("路线段数变化")
-            else:
-                crs = engine.edge_layer.crs()
-                for old_seg, new_seg in zip(old_segments, new_segments):
-                    if abs(float(old_seg.get("distance", 0.0)) - float(new_seg.get("distance", 0.0))) > 0.01:
-                        changed = True
-                        reasons.append("线路距离变化")
-                        break
-                    if _geom_diff(old_seg.get("points", []) or [], new_seg.get("points", []) or [], crs):
-                        changed = True
-                        reasons.append("Pole Edge 路径变化")
-                        break
+
+        old_segments = base.get("segments", []) or []
+        new_segments = proposed.get("segments", []) or []
+        if len(old_segments) != len(new_segments):
+            changed = True
+            reasons.append("路线段数变化")
+        else:
+            crs = controller._prepare_engine().edge_layer.crs() if controller._prepare_engine() else None
+            if crs is None:
+                crs = context.project_layer(_v9._fresh_payload(controller), "Pole Edge").crs()
+            for old_seg, new_seg in zip(old_segments, new_segments):
+                if abs(float(old_seg.get("distance", 0.0)) - float(new_seg.get("distance", 0.0))) > 0.01:
+                    changed = True
+                    reasons.append("线路距离变化")
+                    break
+                if _geom_diff(old_seg.get("points", []) or [], new_seg.get("points", []) or [], crs):
+                    changed = True
+                    reasons.append("Pole Edge 路径变化")
+                    break
+
         if changed:
-            if not reasons:
-                reasons.append("FDT/FAT/Pole Edge 更新后路线发生变化")
+            if meta.get("odn21"):
+                reasons.append("ODN 2.1 规则重新计算")
             changes.append({
                 "key": key,
                 "design_index": index,
                 "type": "线路发生变化",
-                "detail": f"{key}  {'、'.join(reasons)}",
+                "detail": f"{key}  {'、'.join(dict.fromkeys(reasons)) if reasons else '完整重算结果发生变化'}",
                 "repairable": True,
                 "proposed": proposed,
-                "reasons": reasons,
+                "reasons": list(dict.fromkeys(reasons)) or ["完整重算结果发生变化"],
             })
 
     return {"snapshot": baseline, "changes": changes, "error": None}
 
 
 def apply_changes(controller, detection_result):
-    """Commit the already calculated proposals; do not calculate again."""
+    """Replace changed planning data and append new Distribution Cable only."""
     changes = [c for c in detection_result.get("changes", []) or [] if c.get("repairable") and c.get("proposed")]
     if not changes:
         return 0
+
     backup = copy.deepcopy(controller._designs)
     try:
-        for change in changes:
-            idx = int(change["design_index"])
-            controller._designs[idx] = copy.deepcopy(change["proposed"])
+        indexes = sorted({int(c["design_index"]) for c in changes})
+        for index in indexes:
+            proposed = copy.deepcopy(next(c["proposed"] for c in changes if int(c["design_index"]) == index))
+            proposed["written"] = False
+            proposed["written_fids"] = []
+            proposed["needs_resync"] = True
+            controller._designs[index] = proposed
+
+        # User owns cleanup of old Distribution Cable. The plugin only adds the new result.
+        if not controller.write_planned_links():
+            raise RuntimeError("新 Distribution Cable 写入失败。旧 Distribution Cable 未由插件删除。")
+
         controller._persist_state()
         save_snapshot(controller)
         controller._refresh_ui()
-        return len(changes)
+        return len(indexes)
     except Exception:
         controller._designs = backup
         controller._persist_state()
@@ -319,7 +357,7 @@ class ChangeDetectionDialog(QtWidgets.QDialog):
         self.setWindowTitle("变更检测")
         self.resize(600, 430)
         root = QtWidgets.QVBoxLayout(self)
-        summary = QtWidgets.QLabel(f"发现 {len(self.result.get('changes', []) or [])} 条变化")
+        summary = QtWidgets.QLabel(f"完整重算完成：发现 {len(self.result.get('changes', []) or [])} 条变化")
         f = summary.font(); f.setBold(True); f.setPointSize(12); summary.setFont(f)
         root.addWidget(summary)
         self.tree = QtWidgets.QTreeWidget()
@@ -340,7 +378,7 @@ class ChangeDetectionDialog(QtWidgets.QDialog):
             self.tree.setCurrentItem(self.tree.topLevelItem(0))
         row = QtWidgets.QHBoxLayout()
         row.addStretch(1)
-        self.confirm = QtWidgets.QPushButton("确认修改全部")
+        self.confirm = QtWidgets.QPushButton("确认新增新规划/DC")
         cancel = QtWidgets.QPushButton("取消")
         row.addWidget(self.confirm); row.addWidget(cancel); root.addLayout(row)
         self.confirm.clicked.connect(self._confirm)
@@ -362,14 +400,19 @@ class ChangeDetectionDialog(QtWidgets.QDialog):
             lines.append(str(c["reason"]))
         if c.get("repairable"):
             lines.append("处理：按最新 FDT / FAT / Pole Edge 完整重新计算该 Link。")
-            lines.append("原有 FAT 顺序保持不变。")
+            lines.append("ODN 2.1 同时重新执行 BB / SFC CL 固定规则。")
+            lines.append("确认后只新增新的 Distribution Cable，旧 DC 不由插件删除。")
         self.detail.setText("\n".join(lines))
 
     def _confirm(self):
         try:
             count = apply_changes(self.controller, self.result)
         except Exception as exc:
-            QtWidgets.QMessageBox.warning(self, "变更检测", f"确认修改失败：\n{exc}")
+            QtWidgets.QMessageBox.warning(self, "变更检测", f"确认更新失败：\n{exc}")
             return
-        QtWidgets.QMessageBox.information(self, "变更检测", f"已更新 {count} 条 Link。\n\nFAT 顺序保持不变。")
+        QtWidgets.QMessageBox.information(
+            self,
+            "变更检测",
+            f"已重新规划并新增写入 {count} 条 Link。\n\n旧 Distribution Cable 未由插件删除，请手动处理。",
+        )
         self.accept()
