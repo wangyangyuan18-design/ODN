@@ -17,6 +17,9 @@ def classFactory(iface):
     # Install the direction-sensitive Cable Offset patch before Link Design
     # imports any Offset Core entry points.
     from . import cable_offset_direction_fix
+    # Install the final global Main Lane guard after the direction seam so it
+    # wraps the actual Offset Core entry point and the legacy layout allocator.
+    from . import cable_offset_main_lane_guard
     from .link_design import LinkDesignDock
     from .fat_return import install_fat_return_button
     from .link_design_features import install_link_design_feature_buttons
