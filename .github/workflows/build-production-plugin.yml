@@ -76,9 +76,18 @@ jobs:
           ZIP="dist/ODN_Tools_Pro-v${{ steps.version.outputs.version }}.zip"
           test -f "$ZIP"
           unzip -t "$ZIP"
-          unzip -l "$ZIP" | grep -E 'ODN_Tools_Pro/(metadata.txt|__init__\.py|icons/odn_tools_pro\.svg)$'
-          unzip -l "$ZIP" | grep -E 'ODN_Tools_Pro/tools/(validate_plugin\.py|fat_trace_build_ready\.txt|patch_fat_trace\.py)$'
-          ! unzip -l "$ZIP" | grep -E '(^|/)\.git/|(^|/)\.github/|(^|/)__pycache__/|\.pyc$|ODN_Tools_Pro.*\.zip$'
+
+          unzip -Z1 "$ZIP" | grep -Fx 'ODN_Tools_Pro/metadata.txt'
+          unzip -Z1 "$ZIP" | grep -Fx 'ODN_Tools_Pro/__init__.py'
+          unzip -Z1 "$ZIP" | grep -Fx 'ODN_Tools_Pro/icons/odn_tools_pro.svg'
+          unzip -Z1 "$ZIP" | grep -Fx 'ODN_Tools_Pro/tools/validate_plugin.py'
+          unzip -Z1 "$ZIP" | grep -Fx 'ODN_Tools_Pro/tools/fat_trace_build_ready.txt'
+          unzip -Z1 "$ZIP" | grep -Fx 'ODN_Tools_Pro/tools/patch_fat_trace.py'
+
+          if unzip -Z1 "$ZIP" | grep -E '(^|/)\.git/|(^|/)\.github/|(^|/)__pycache__/|\.pyc$|ODN_Tools_Pro.*\.zip$'; then
+            echo 'ERROR: production ZIP contains excluded files.'
+            exit 1
+          fi
 
       - name: Generate SHA256
         shell: bash
