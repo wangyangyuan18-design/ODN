@@ -20,6 +20,10 @@ def classFactory(iface):
     from . import cable_offset_join_corner_rules
     # Final single global lane allocator: Main/side/order/compactness/crossing control.
     from . import cable_offset_lane_optimizer_final
+    # ODN 2.1 planning seam: automatically inserts real BB / SFC CL nodes
+    # before the normal Link Design save/write pipeline runs.
+    from . import odn21_planning
+    odn21_planning.install()
     from .link_design import LinkDesignDock
     from .fat_return import install_fat_return_button
     from .link_design_features import install_link_design_feature_buttons
