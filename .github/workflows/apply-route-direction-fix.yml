@@ -1,0 +1,168 @@
+name: Apply route-direction fix
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Patch Cable Offset route orientation
+        shell: python
+        run: |
+          from pathlib import Path
+
+          path = Path('cable_offset_core.py')
+          text = path.read_text(encoding='utf-8')
+          original = text
+
+          old = '''            for edge_index, edge in enumerate(edges):
+                a, b = _base._edge_points(edge)
+                a = _tp(a, edge_crs, work_crs)
+                b = _tp(b, edge_crs, work_crs)
+                use = _base._LayoutUse(
+                    design_index,
+                    segment_index,
+                    edge_index,
+                    edge,
+                    start,
+                    end,
+                    _base._route_side_hint(start, end, a, b),
+                )
+'''
+          new = '''            for edge_index, edge in enumerate(edges):
+                # IMPORTANT: edge is canonical/unoriented and is used only as
+                # the physical Edge identity.  Lane side must follow the
+                # actual route direction for this segment.
+                a = QgsPointXY(nodes[edge_index])
+                b = QgsPointXY(nodes[edge_index + 1])
+                use = _base._LayoutUse(
+                    design_index,
+                    segment_index,
+                    edge_index,
+                    edge,
+                    start,
+                    end,
+                    _base._route_side_hint(start, end, a, b),
+                )
+                use.route_a = QgsPointXY(a)
+                use.route_b = QgsPointXY(b)
+'''
+          if old not in text:
+              raise SystemExit('PATCH-FAIL: _collect_uses block not found')
+          text = text.replace(old, new, 1)
+
+          old = '''def _build_corner_geometry(node, in_edge, out_edge, prev_slot, next_slot, spacing, return_context=False):
+    in_a, in_b = _edge_points_work(in_edge)
+    out_a, out_b = _edge_points_work(out_edge)
+    decision = _corner_decision(prev_slot, next_slot, return_context=return_context)
+'''
+          new = '''def _build_corner_geometry(
+    node,
+    in_a,
+    in_b,
+    out_a,
+    out_b,
+    prev_slot,
+    next_slot,
+    spacing,
+    return_context=False,
+):
+    # in_a -> in_b and out_a -> out_b are ORIENTED route directions.
+    # Canonical Edge orientation must never be used for lateral geometry.
+    decision = _corner_decision(prev_slot, next_slot, return_context=return_context)
+'''
+          if old not in text:
+              raise SystemExit('PATCH-FAIL: _build_corner_geometry signature not found')
+          text = text.replace(old, new, 1)
+
+          replacements = [
+              ('''                edges[edge_index],\n                edges[edge_index + 1],\n                slot,\n                next_slot,\n                spacing,\n                return_context=bool(segment.get("_odn_return_end")) and edge_index + 1 == len(slots) - 1,\n''', '''                a,\n                b,\n                b,\n                nodes[edge_index + 2],\n                slot,\n                next_slot,\n                spacing,\n                return_context=bool(segment.get("_odn_return_end")) and edge_index + 1 == len(slots) - 1,\n'''),
+              ('''            node, prev_edge, next_edge, prev_slot, next_slot, spacing, return_context=False\n''', '''            node,\n            left_nodes[-2], node,\n            node, right_nodes[1],\n            prev_slot, next_slot, spacing, return_context=False\n'''),
+          ]
+          for old, new in replacements:
+              if old not in text:
+                  raise SystemExit('PATCH-FAIL: corner call site not found')
+              text = text.replace(old, new, 1)
+
+          # Remove the canonical endpoint cache from the active geometry path.
+          old = '''    _WORK_EDGE_POINTS.clear()
+    for edge in edges:
+        a, b = _base._edge_points(edge)
+        _WORK_EDGE_POINTS[edge] = (_tp(a, edge_crs, work), _tp(b, edge_crs, work))
+
+'''
+          new = '''    # Corner geometry uses route nodes below, which preserve direction.
+    # Do not rebuild an edge from canonical A->B orientation here.
+
+'''
+          if old not in text:
+              raise SystemExit('PATCH-FAIL: geometry edge cache block not found')
+          text = text.replace(old, new, 1)
+
+          # Remove the canonical endpoint cache from the FAT-boundary corner path.
+          old = '''        _WORK_EDGE_POINTS.clear()
+        for edge in (prev_edge, next_edge):
+            a, b = _base._edge_points(edge)
+            _WORK_EDGE_POINTS[edge] = (_tp(a, edge_crs, work), _tp(b, edge_crs, work))
+
+'''
+          new = '''        # Boundary corner also uses the actual incoming/outgoing route nodes,
+        # never canonical Edge orientation.
+
+'''
+          if old not in text:
+              raise SystemExit('PATCH-FAIL: boundary edge cache block not found')
+          text = text.replace(old, new, 1)
+
+          # Add explicit route-direction diagnostics immediately after the route
+          # nodes are validated. This makes future multi-direction tests obvious.
+          marker = '''            if len(nodes) != len(edges) + 1:
+                continue
+            start = _tp(
+'''
+          replacement = '''            if len(nodes) != len(edges) + 1:
+                continue
+            for edge_index, edge in enumerate(edges):
+                ra = nodes[edge_index]
+                rb = nodes[edge_index + 1]
+                ca, cb = _base._edge_points(edge)
+                canonical_same = (
+                    hypot(ra.x() - _tp(ca, edge_crs, work_crs).x(), ra.y() - _tp(ca, edge_crs, work_crs).y())
+                    <= 1e-6
+                    and hypot(rb.x() - _tp(cb, edge_crs, work_crs).x(), rb.y() - _tp(cb, edge_crs, work_crs).y())
+                    <= 1e-6
+                )
+                _log(
+                    f"[route-direction] link={design.get('link','')}; segment={segment_index}; "
+                    f"edge={edge_index}; route={_corner_debug_point(ra)}->{_corner_debug_point(rb)}; "
+                    f"canonical={_corner_debug_point(_tp(ca, edge_crs, work_crs))}->{_corner_debug_point(_tp(cb, edge_crs, work_crs))}; "
+                    f"same={int(canonical_same)}; reversed={int(not canonical_same)}"
+                )
+            start = _tp(
+'''
+          if marker not in text:
+              raise SystemExit('PATCH-FAIL: diagnostics marker not found')
+          text = text.replace(marker, replacement, 1)
+
+          if text == original:
+              raise SystemExit('PATCH-FAIL: no changes made')
+          path.write_text(text, encoding='utf-8')
+
+      - name: Commit patched source and remove one-shot workflow
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add cable_offset_core.py
+          git rm .github/workflows/apply-route-direction-fix.yml
+          git commit -m "fix: preserve oriented route direction in cable offset"
+          git push
