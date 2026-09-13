@@ -20,6 +20,7 @@ NODE_EPS_M = 0.05
 _ORIGINAL_SET_FLAGS = _core._set_flags
 _ORIGINAL_PLAN = _core._plan
 _ORIGINAL_GEOMETRY = _core._geometry
+_ORIGINAL_VALIDATE_POLE = _core._validate_pole_exclusivity
 _INSTALLED = False
 
 
@@ -65,7 +66,6 @@ def _return_candidates(design):
     candidates = []
     seen = set()
 
-    # Explicit marker path, but topology is still mandatory.
     for marker_index, marker_segment in enumerate(segments):
         marker_item_a = _sequence_item(sequence_ids, marker_index)
         marker_item_b = _sequence_item(sequence_ids, marker_index + 1)
@@ -103,7 +103,6 @@ def _return_candidates(design):
             seen.add(candidate)
             candidates.append((candidate[0], candidate[1], "FATRETURN_MARKER"))
 
-    # Topology-only authoritative path.
     for fat_index, fat_segment in enumerate(segments):
         fat_edges = _edge_list(fat_segment)
         if not fat_edges:
@@ -351,7 +350,6 @@ def _normalize_lanes(designs, dc, edge_layer, spacing, result):
         ),
     )
 
-    # These are route state, not local-edge state.
     main_owner = {}
     side_memory = {}
     order_memory = {}
@@ -506,8 +504,6 @@ def _normalize_lanes(designs, dc, edge_layer, spacing, result):
                         preserved += 1
                 magnitude += 1
 
-        # Real constraints from Return/Pole policy are never erased by the
-        # normalization pass.
         for use in uses:
             key = (use.design_index, use.segment_index, use.edge_index)
             if key in assigned_slots:
@@ -548,9 +544,71 @@ def _normalize_lanes(designs, dc, edge_layer, spacing, result):
     return (edge_crs, work, ordered, routes, slots)
 
 
+def _preplan_validate_pole_exclusivity(designs, edge_crs, work):
+    """Defer Pole landing validation until after Lane planning.
+
+    The old Core check conflated a route endpoint with a guaranteed physical
+    landing, so it could abort before the affected cable had a chance to move
+    off Main Lane because of a real Pole conflict.
+    """
+    return None
+
+
+def _validate_final_pole_landings(designs, edge_crs, work, slots):
+    owners = {}
+    for design_index, design in enumerate(designs or []):
+        sequence_ids = design.get("sequence_ids", []) or []
+        for segment_index, segment in enumerate(design.get("segments", []) or []):
+            edges = _edge_list(segment)
+            if not edges:
+                continue
+            nodes = _base._extract_route_graph_nodes(segment, work, edge_crs, edge_crs)
+            if len(nodes) != len(edges) + 1:
+                continue
+
+            start_item = _sequence_item(sequence_ids, segment_index)
+            end_item = _sequence_item(sequence_ids, segment_index + 1)
+            first_slot = int(slots.get((design_index, segment_index, 0), 0))
+            last_slot = int(slots.get((design_index, segment_index, len(edges) - 1), 0))
+
+            if start_item is not None and (first_slot == 0 or segment.get("_odn_special_start")):
+                owners.setdefault(_node_key(nodes[0]), []).append(
+                    (design_index, segment_index, "START", _kind(start_item))
+                )
+            if end_item is not None and (last_slot == 0 or segment.get("_odn_special_end")):
+                owners.setdefault(_node_key(nodes[-1]), []).append(
+                    (design_index, segment_index, "END", _kind(end_item))
+                )
+
+    conflicts = []
+    for node_key, items in owners.items():
+        independent = sorted({item[0] for item in items})
+        if len(independent) <= 1:
+            continue
+        kinds = [item[3] for item in items]
+        if kinds and all(
+            _core._shared_node(kind) or str(kind).startswith("FATRETURN")
+            for kind in kinds
+        ):
+            continue
+        conflicts.append((node_key, independent))
+
+    if conflicts:
+        detail = " | ".join(
+            f"node={key}; links={[designs[i].get('_link_id', designs[i].get('link', i)) for i in ids]}"
+            for key, ids in conflicts[:20]
+        )
+        raise RuntimeError(
+            "Offset Policy: ordinary Pole has multiple final Cable landings: " + detail
+        )
+
+
 def _patched_plan(designs, dc, edge_layer, spacing):
     result = _ORIGINAL_PLAN(designs, dc, edge_layer, spacing)
-    return _normalize_lanes(designs, dc, edge_layer, spacing, result)
+    normalized = _normalize_lanes(designs, dc, edge_layer, spacing, result)
+    edge_crs, work, ordered, routes, slots = normalized
+    _validate_final_pole_landings(designs, edge_crs, work, slots)
+    return normalized
 
 
 def _return_anchored_geometry(segment, slot_by_edge, spacing, work, edge_crs, control):
@@ -593,6 +651,7 @@ def install():
     if _INSTALLED:
         return
     _core._set_flags = _set_flags
+    _core._validate_pole_exclusivity = _preplan_validate_pole_exclusivity
     _core._plan = _patched_plan
     _core._geometry = _return_anchored_geometry
     _INSTALLED = True
