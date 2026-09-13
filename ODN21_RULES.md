@@ -1,37 +1,97 @@
-# ODN 2.1 自动节点规划规则
+# ODN 2.1 自动节点规划最终规则
 
-本规则不修改 Project Configuration UI。工程配置已有的 ODN Version、节点类型和长度参数作为唯一输入。
+本文件记录当前唯一有效的 ODN 2.1 BB / SFC CL 工程规则。规则不通过 Project Configuration UI、参数字段或其他模块再次定义；代码中只保留一个固定规则入口。
 
 ## 1. 基础路线
 
-Link Design 继续使用现有 Pole Edge 路由。ODN 2.1 不建立第二套物理路由算法。
+- Link Design 继续使用现有 Pole Edge 路由。
+- ODN 2.1 不建立第二套物理路由算法。
+- BB 和 SFC CL 是真实 ODN 节点；进入 Link sequence 后，后续路线必须从该节点重新开始计算。
+- Offset Core 不负责判断 BB/SFC CL 规则，也不修改现有 0.5m、0.3m、Corner、Lane、FAT Landing 规则。
 
-## 2. BB
+## 2. BB：回缆超过 100m
 
-- 回缆必须从实际 Pole Edge 路由判断，不能仅按方向或拐角判断。
-- 回缆定义为同一 Pole Edge 被去程和回程重复经过，例如 A→B→A。
-- A→B = 45m 时，回缆长度 = 90m。
-- 当回缆超过工程配置的 BB 触发条件时，自动规划 BB。
-- BB 优先放在实际 Pole Edge 的叉路口/分岔节点，而不是简单按超限距离截断。
-- 候选叉路口需要比较上游 FAT→BB 以及 BB→下游 FAT 的实际 Pole Edge 路由；在满足约束的候选节点中优先选择三段（或实际分支段）总路由距离较短的节点。
-- BB 插入后成为新的 ODN 网络节点，后续 DC 长度计算不得跨越 BB 继续累计。
+回缆的定义已经固定：
 
-## 3. SFC Closure
+**回缆长度 =（起点 → 终点）的 Pole Edge 单程距离 × 2。**
 
-- 预链接/Distribution Cable 的长度限制来自工程配置，当前默认 455m。
-- 判断必须基于实际 Pole Edge 路由的逐杆累计距离。
-- 如果下一根杆会使累计距离超过 455m，则不能把 SFC Closure 放在下一根杆。
-- 选择距离起点最近方向上最后一个累计距离仍 <=455m 的实际 Pole 节点。例如 410m 后下一根为 460m，则 SFC Closure 放在 410m 节点。
-- SFC Closure 插入后，从该节点重新开始累计下一段 DC 长度。
-- 已经由 BB 切开的 DC 段必须分别计算，不能把 BB 前后的距离合并成 FAT→FAT 总长度再判断。
+- “起点”和“终点”使用 Link Design 当前路线中已经定义的回缆起点、终点。
+- 例如起点 → 终点 Pole Edge = 45m，则回缆 = 45 × 2 = 90m，不加 BB。
+- 如果回缆 >100m，则必须加 BB。
+- BB **固定加在之前已经定义的回缆终点处**。
+- 不再寻找候选分叉点。
+- 不进行候选点评分。
+- 不进行距离优化。
+- 不进行其他位置选择。
+- BB 加入后成为新的 ODN 节点，从该节点继续计算下一段路线。
 
-## 4. 实施原则
+## 3. SFC CL：单段不超过 455m
 
-- 不增加新的 Link Design UI。
-- 不增加新的 Project Configuration UI。
-- 不修改现有 0.5m offset、corner、return cable geometry 和 FAT landing 引擎。
+SFC CL 的起算点固定为当前段的**起点 / 汇聚点 / 出发点**。
+
+计算方式严格按 Pole Edge 一根一根累计：
+
+1. 从当前段起点开始累计距离。
+2. 如果下一根杆加入后累计距离 **≤455m**，继续向下一根杆计算。
+3. 如果下一根杆加入后累计距离 **>455m**，不使用这根杆。
+4. **退回上一根仍满足 ≤455m 的杆。**
+5. 在这根杆处增加 SFC CL。
+6. SFC CL 成为新的起点，下一段重新从 0 开始累计。
+
+例如：
+
+```text
+起点
+  ↓
+180m
+  ↓
+Pole 1
+  ↓
+230m
+  ↓
+Pole 2 = 410m    ← 合法
+  ↓
+50m
+  ↓
+Pole 3 = 460m    ← 超过455m，不使用
+```
+
+结果：
+
+```text
+起点 → Pole 1 → Pole 2 → SFC CL
+                         ↓
+                    新段重新计算
+```
+
+因此：
+
+**SFC CL 的位置是唯一确定的最后一根合法杆，不存在候选位置优化。**
+
+## 4. BB / SFC CL 与变更检测
+
+- 变更检测每次点击都必须重新完整计算所有已保存 Link，不以“是否已发现变化”为前提跳过重算。
+- 完整重算必须包含 ODN 2.1 BB / SFC CL 规则。
+- 旧规划如果缺少现在规则要求的 BB / SFC CL，应在完整重算后被识别为变化。
+- 用户确认后，插件只把新的规划结果和新的 Distribution Cable 写入图层。
+- **插件不得删除旧 Distribution Cable。**
+- 旧 Distribution Cable 由用户自行手动删除。
+
+## 5. 规则唯一性
+
+ODN 2.1 不允许同一个工程规则存在多个可变入口。
+
+唯一规则为：
+
+```text
+BB return limit = 100m
+SFC CL segment limit = 455m
+```
+
+上述两个值不是项目参数，不通过其他 UI 或诊断参数覆盖。
+
+## 6. 兼容性
+
 - ODN 2.0 行为保持不变。
-- ODN 2.1 只在项目配置明确启用 ODN 2.1 且 BB/SFC Closure 节点已配置时启用对应规则。
-- 所有自动判断先写入详细 QGIS Message Log，至少记录：Link、Segment、实际长度、限制值、回缆边、候选 BB 节点、SFC 最后合法杆节点及累计距离。
-
-<!-- rebuild marker: endpoint-only Pole occupancy rules restored -->
+- ODN 2.1 只有在项目明确配置对应 BB / SFC CL 节点图层时才执行对应规则。
+- BB / SFC CL 不修改 Offset Core。
