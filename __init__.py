@@ -18,8 +18,8 @@ def classFactory(iface):
     from . import cable_offset_direction_fix
     from . import cable_offset_policy
     from . import cable_offset_join_corner_rules
-    # Final single global lane optimizer: Main/side/order/compactness/crossing control.
-    from . import cable_offset_lane_optimizer
+    # Final single global lane allocator: Main/side/order/compactness/crossing control.
+    from . import cable_offset_lane_optimizer_final
     from .link_design import LinkDesignDock
     from .fat_return import install_fat_return_button
     from .link_design_features import install_link_design_feature_buttons
