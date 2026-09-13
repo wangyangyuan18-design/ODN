@@ -1,0 +1,100 @@
+name: Build Production Plugin ZIP
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate-and-build:
+    name: Validate and build production ZIP
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Validate plugin structure and interfaces
+        run: python tools/validate_plugin.py
+
+      - name: Compile Python sources
+        run: |
+          python -m compileall -q \
+            --invalidation-mode checked-hash \
+            --exclude='(^|/)\.git(/|$)' \
+            .
+
+      - name: Read plugin version
+        id: version
+        shell: bash
+        run: |
+          VERSION=$(python - <<'PY'
+          import configparser
+          from pathlib import Path
+
+          parser = configparser.ConfigParser(interpolation=None)
+          parser.read(Path('metadata.txt'), encoding='utf-8')
+          print(parser['general']['version'].strip())
+          PY
+          )
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Production version: $VERSION"
+
+      - name: Build production ZIP
+        shell: bash
+        run: |
+          rm -rf dist
+          mkdir -p dist/package/ODN_Tools_Pro
+
+          rsync -a \
+            --exclude='.git/' \
+            --exclude='.github/' \
+            --exclude='dist/' \
+            --exclude='__pycache__/' \
+            --exclude='*.pyc' \
+            --exclude='*.pyo' \
+            --exclude='.pytest_cache/' \
+            --exclude='.mypy_cache/' \
+            --exclude='.ruff_cache/' \
+            --exclude='*.zip' \
+            ./ dist/package/ODN_Tools_Pro/
+
+          cd dist/package
+          zip -qr "../ODN_Tools_Pro-v${{ steps.version.outputs.version }}.zip" ODN_Tools_Pro
+
+      - name: Verify ZIP contents
+        shell: bash
+        run: |
+          ZIP="dist/ODN_Tools_Pro-v${{ steps.version.outputs.version }}.zip"
+          test -f "$ZIP"
+          unzip -t "$ZIP"
+          unzip -l "$ZIP" | grep -E 'ODN_Tools_Pro/(metadata.txt|__init__\.py|icons/odn_tools_pro\.svg)$'
+          ! unzip -l "$ZIP" | grep -E '(^|/)\.git/|(^|/)\.github/|(^|/)__pycache__/|\.pyc$|ODN_Tools_Pro.*\.zip$'
+
+      - name: Upload production ZIP artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ODN_Tools_Pro-production-v${{ steps.version.outputs.version }}-${{ github.sha }}
+          path: dist/ODN_Tools_Pro-v${{ steps.version.outputs.version }}.zip
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload stable latest ZIP artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ODN_Tools_Pro-production-latest
+          path: dist/ODN_Tools_Pro-v${{ steps.version.outputs.version }}.zip
+          if-no-files-found: error
+          retention-days: 30
